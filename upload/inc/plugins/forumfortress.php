@@ -2,8 +2,8 @@
 /**
  * Forum Fortress for MyBB 1.8.
  *
- * Copyright (c) 2026 Forum Fortress.
- * Distributed under the Forum Fortress Plugin License, Version 1.0.
+ * Copyright (c) 2026 Marscastle Ltd trading as Forum Fortress.
+ * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 if(!defined('IN_MYBB'))
@@ -11,7 +11,7 @@ if(!defined('IN_MYBB'))
 	die('This file cannot be accessed directly.');
 }
 
-define('FORUMFORTRESS_MYBB_VERSION', '1.2');
+define('FORUMFORTRESS_MYBB_VERSION', '1.1.6');
 
 global $plugins;
 if(isset($plugins))
@@ -83,11 +83,11 @@ function forumfortress_install()
 	// The old free-form URL is no longer administrator-configurable. Keep its
 	// recognized regional intent, then remove the generated MyBB setting row.
 	$db->delete_query('settings', "name='forumfortress_api_base_url'");
+	$db->delete_query('settings', "name='forumfortress_control_base_url'");
 	$settings = array(
 		'forumfortress_enabled' => array('Enabled', 'Enable Forum Fortress checks and background bootstrap.', 'yesno', '1'),
 		'forumfortress_api_region' => array('API region', 'Lock check traffic to a region, or use the recommended global network.', "select\nglobal=Global - Recommended\nuk=United Kingdom only\neu=European Union only\nus=United States only", $legacy_region),
 		'forumfortress_allow_global_fallback' => array('Allow global emergency fallback', 'After a regional retry fails, permit the global network. Processing may occur outside the selected region.', 'yesno', '0'),
-		'forumfortress_control_base_url' => array('Control base URL', 'Forum Fortress control-plane base URL used for bootstrap and portal operations.', 'text', 'https://control.ffapi.net'),
 		'forumfortress_timeout' => array('Request timeout', 'Maximum API request time in seconds (1–30).', 'numeric', '5'),
 		'forumfortress_fail_open' => array('Fail open', 'Allow an action when Forum Fortress is unavailable. Disable only when your forum can tolerate API outages blocking registrations and content.', 'yesno', '1'),
 		'forumfortress_api_key' => array('API key', 'Stored automatically after anonymous bootstrap, or paste a live key from Forum Fortress.', 'text', ''),
@@ -178,7 +178,7 @@ function forumfortress_background_bootstrap()
 	}
 	try
 	{
-		ForumFortressMyBB::bootstrap_if_needed();
+		ForumFortressMyBB::background_maintenance();
 	}
 	catch(Exception $e)
 	{
@@ -401,7 +401,7 @@ function forumfortress_admin_page()
 		'Protection' => ForumFortressMyBB::enabled() ? ($hasIdentity ? 'Active' : 'Configured') : 'Disabled',
 		'Plan' => isset($status['plan']) ? $status['plan'] : 'Refresh to view',
 		'Domain' => ForumFortressMyBB::domain(),
-		'Preferred endpoint' => isset($state['preferred_endpoint']) ? $state['preferred_endpoint'] : 'Automatic selection',
+		'GeoDNS route' => isset($state['preferred_endpoint']) ? $state['preferred_endpoint'] : 'https://api.ffapi.net',
 		'Last responded endpoint' => isset($state['last_responded_endpoint']) ? $state['last_responded_endpoint'] : 'Refresh to view',
 		'Attack mode' => isset($status['attack_mode_active']) ? (!empty($status['attack_mode_active']) ? 'Active' : 'Inactive') : 'Unknown',
 	);
@@ -459,6 +459,7 @@ function forumfortress_settings_gid()
 
 class ForumFortressMyBB
 {
+	const CONTROL_BASE_URL = 'https://fortress.ffapi.net';
 	protected static $request_meta = array();
 	protected static $bootstrap_in_progress = false;
 	protected static $bootstrap_attempted = false;
@@ -479,17 +480,50 @@ class ForumFortressMyBB
 	public static function api_base_url()
 	{
 		$legacy = self::setting('forumfortress_api_base_url', '');
-		$legacy_host = strtolower((string)@parse_url($legacy, PHP_URL_HOST));
-		if(self::setting('forumfortress_api_region', '') === '' && in_array($legacy_host, array('localhost', '127.0.0.1', '::1'), true)) return rtrim($legacy, '/');
+		// The live lifecycle harness deliberately routes CLI traffic to its
+		// localhost fixture. The test seam must not depend on whether a fresh
+		// install has already written the default api_region setting.
+		$region = strtolower(trim(self::setting('forumfortress_api_region', '')));
+		if(PHP_SAPI === 'cli' && in_array($region, array('', 'global'), true) && defined('FORUMFORTRESS_MYBB_TEST_CONTROL_BASE_URL') && hash_equals(rtrim((string)FORUMFORTRESS_MYBB_TEST_CONTROL_BASE_URL, '/'), rtrim($legacy, '/'))) return rtrim($legacy, '/');
 		$map = array('global' => 'https://api.ffapi.net', 'uk' => 'https://api-uk.ffapi.net', 'eu' => 'https://api-eu.ffapi.net', 'us' => 'https://api-us.ffapi.net');
 		return $map[self::api_region()];
 	}
 	public static function allow_global_emergency_fallback() { return self::setting('forumfortress_allow_global_fallback', '0') === '1'; }
+	public static function control_base_url()
+	{
+		// Deterministic localhost integration tests run in CLI only; web and cron
+		// traffic always use the fixed public plugin service.
+		if(PHP_SAPI === 'cli' && defined('FORUMFORTRESS_MYBB_TEST_CONTROL_BASE_URL'))
+		{
+			$test = rtrim((string)FORUMFORTRESS_MYBB_TEST_CONTROL_BASE_URL, '/');
+			$host = strtolower((string)@parse_url($test, PHP_URL_HOST));
+			if(in_array($host, array('localhost', '127.0.0.1', '::1'), true)) return $test;
+		}
+		return self::CONTROL_BASE_URL;
+	}
 	public static function background_bootstrap_allowed()
 	{
-		if(trim(self::setting('forumfortress_api_key')) !== '' && trim(self::setting('forumfortress_site_id')) !== '') return false;
 		$script = defined('THIS_SCRIPT') ? THIS_SCRIPT : (isset($_SERVER['SCRIPT_NAME']) ? basename($_SERVER['SCRIPT_NAME']) : '');
 		return in_array($script, array('index.php', 'portal.php', 'forumdisplay.php', 'showthread.php', 'newthread.php', 'newreply.php', 'usercp.php', 'contact.php'), true);
+	}
+	public static function background_maintenance()
+	{
+		if(!self::enabled()) return;
+		$key = trim(self::setting('forumfortress_api_key'));
+		$site = trim(self::setting('forumfortress_site_id'));
+		if($key === '' || $site === '')
+		{
+			self::bootstrap_if_needed();
+			$key = trim(self::setting('forumfortress_api_key'));
+			$site = trim(self::setting('forumfortress_site_id'));
+			if($key === '' || $site === '') return;
+		}
+		$state = self::state(); $now = time();
+		$last_success = isset($state['last_site_ping_at']) ? (int)$state['last_site_ping_at'] : 0;
+		$last_attempt = isset($state['last_site_ping_attempt_at']) ? (int)$state['last_site_ping_attempt_at'] : 0;
+		if($last_success > $now - 3600 || $last_attempt > $now - 300) return;
+		$state['last_site_ping_attempt_at'] = $now; self::save_state($state); self::rebuild_settings_cache();
+		self::site_ping(2);
 	}
 	public static function domain()
 	{
@@ -514,9 +548,8 @@ class ForumFortressMyBB
 	{
 		$url = trim((string)$url); if($url === '') return false;
 		$parts = @parse_url($url); if(!is_array($parts) || empty($parts['scheme']) || empty($parts['host']) || !empty($parts['user']) || !empty($parts['pass']) || !empty($parts['query']) || !empty($parts['fragment'])) return false;
-		$scheme = strtolower($parts['scheme']); $host = strtolower($parts['host']);
-		if($scheme === 'https') return true;
-		return $scheme === 'http' && in_array($host, array('localhost', '127.0.0.1', '::1'), true);
+		if(strtolower($parts['scheme']) === 'https') return true;
+		return PHP_SAPI === 'cli' && defined('FORUMFORTRESS_MYBB_TEST_CONTROL_BASE_URL') && hash_equals(rtrim((string)FORUMFORTRESS_MYBB_TEST_CONTROL_BASE_URL, '/'), rtrim($url, '/'));
 	}
 	public static function safe_portal_url($url)
 	{
@@ -545,7 +578,7 @@ class ForumFortressMyBB
 			}
 		}
 		if($scheme !== 'http') return false;
-		foreach (array(self::setting('forumfortress_control_base_url'), self::setting('forumfortress_api_base_url'), self::setting('bburl')) as $configured)
+		foreach (array(self::control_base_url(), self::setting('forumfortress_api_base_url'), self::setting('bburl')) as $configured)
 		{
 			$configured_parts = @parse_url((string)$configured);
 			if(!is_array($configured_parts) || !self::valid_base_url((string)$configured)) continue;
@@ -567,7 +600,7 @@ class ForumFortressMyBB
 	protected static function candidate_portal_hosts()
 	{
 		$hosts = array();
-		foreach(array(self::setting('forumfortress_api_base_url'), self::setting('forumfortress_control_base_url'), self::setting('bburl')) as $candidate)
+		foreach(array(self::setting('forumfortress_api_base_url'), self::control_base_url(), self::setting('bburl')) as $candidate)
 		{
 			$host = self::derive_portal_host((string)$candidate);
 			if($host !== '')
@@ -591,6 +624,7 @@ class ForumFortressMyBB
 		{
 			return 'portal.' . substr($host, 8);
 		}
+		if($host === 'fortress.ffapi.net') return 'portal.ffapi.net';
 		return $host;
 	}
 
@@ -622,12 +656,8 @@ class ForumFortressMyBB
 			$candidates[] = self::api_base_url();
 			if(self::allow_global_emergency_fallback()) $candidates[] = 'https://api.ffapi.net';
 		}
-		else
-		{
-			if(!$control && !empty($state['preferred_endpoint'])) $candidates[] = $state['preferred_endpoint'];
-			$candidates[] = self::setting($control ? 'forumfortress_control_base_url' : 'forumfortress_api_base_url');
-		}
-		if(!$control && self::api_region() === 'global') $candidates[] = self::setting('forumfortress_control_base_url');
+		else $candidates[] = $control ? self::control_base_url() : self::api_base_url();
+		if(!$control && self::api_region() === 'global') $candidates[] = self::control_base_url();
 		$out = array(); foreach($candidates as $candidate) { if(self::valid_base_url($candidate)) { $candidate = rtrim($candidate, '/'); if(!in_array($candidate, $out, true)) $out[] = $candidate; } }
 		return $out;
 	}
@@ -649,8 +679,11 @@ class ForumFortressMyBB
 			}
 			else
 			{
-				$candidates = self::endpoint_candidates(true);
-				$candidates[] = self::api_base_url();
+				$api = self::api_base_url();
+				$host = strtolower((string)@parse_url($api, PHP_URL_HOST));
+				if(in_array($host, array('localhost', '127.0.0.1', '::1'), true)) $candidates[] = $api;
+				$candidates = array_merge($candidates, self::endpoint_candidates(true));
+				$candidates[] = $api;
 			}
 		}
 		$out = array();
@@ -699,7 +732,7 @@ class ForumFortressMyBB
 		$returned_key = isset($response['api_key']) ? trim((string)$response['api_key']) : '';
 		if($returned_key !== '') self::save_setting('forumfortress_api_key', $returned_key);
 		if(!empty($response['site_id'])) self::save_setting('forumfortress_site_id', $response['site_id']);
-		$state = self::state(); $preferred = isset($response['preferred_endpoint']) ? $response['preferred_endpoint'] : $base; $preferred = self::valid_base_url($preferred) ? rtrim($preferred, '/') : $base; $state['preferred_endpoint'] = $preferred; $state['last_responded_endpoint'] = $base; $state['last_bootstrap_at'] = time(); $state['key_type'] = isset($response['key_type']) ? (string)$response['key_type'] : ($returned_key !== '' ? (strpos($returned_key, 'ff_ob_') === 0 ? 'offline_bootstrap' : 'normal') : (isset($state['key_type']) ? $state['key_type'] : 'normal')); if(isset($response['fallback_bootstrap_endpoints']) && is_array($response['fallback_bootstrap_endpoints'])) $state['fallback_bootstrap_endpoints'] = $response['fallback_bootstrap_endpoints']; unset($state['last_bootstrap_failure_at'], $state['last_bootstrap_error'], $state['bootstrap_lock_until']); self::save_state($state); self::rebuild_settings_cache();
+		$state = self::state(); $state['key_type'] = isset($response['key_type']) ? (string)$response['key_type'] : ($returned_key !== '' ? (strpos($returned_key, 'ff_ob_') === 0 ? 'offline_bootstrap' : 'normal') : (isset($state['key_type']) ? $state['key_type'] : 'normal')); $preferred = $state['key_type'] === 'offline_bootstrap' && isset($response['preferred_endpoint']) ? $response['preferred_endpoint'] : self::api_base_url(); $state['preferred_endpoint'] = self::valid_base_url($preferred) ? rtrim($preferred, '/') : self::api_base_url(); $state['last_responded_endpoint'] = $base; $state['last_bootstrap_at'] = time(); if(isset($response['fallback_bootstrap_endpoints']) && is_array($response['fallback_bootstrap_endpoints'])) $state['fallback_bootstrap_endpoints'] = $response['fallback_bootstrap_endpoints']; unset($state['last_bootstrap_failure_at'], $state['last_bootstrap_error'], $state['bootstrap_lock_until']); self::save_state($state); self::rebuild_settings_cache();
 	}
 	public static function check($endpoint, $payload)
 	{
@@ -714,7 +747,7 @@ class ForumFortressMyBB
 		if(!self::enabled() || trim(self::setting('forumfortress_api_key')) === '' || !in_array($endpoint, array('moderation', 'register', 'ham'), true)) return null;
 		return self::request('POST', '/v1/report/'.$endpoint, $payload, false, 1);
 	}
-	public static function request($method, $path, $payload=array(), $control=false, $timeout=null)
+	public static function request($method, $path, $payload=array(), $control=false, $timeout=null, $allow_rebootstrap=true)
 	{
 		$defaults = array('domain' => self::domain());
 		if(strtoupper($method) !== 'GET') $defaults = array_merge($defaults, array('api_key' => self::setting('forumfortress_api_key'), 'site_id' => self::setting('forumfortress_site_id'), 'platform' => 'mybb', 'plugin_version' => FORUMFORTRESS_MYBB_VERSION));
@@ -732,9 +765,61 @@ class ForumFortressMyBB
 				if($path === '/v1/site/status' || $path === '/v1/site/bootstrap' || (strpos($path, '/v1/check/') === 0 && (isset($response['api_key']) || isset($response['site_id'])))) self::persist_identity($response, $base);
 				return $response;
 			}
+			if($allow_rebootstrap && self::should_rebootstrap($path))
+			{
+				$previous_key = self::setting('forumfortress_api_key');
+				$previous_site = self::setting('forumfortress_site_id');
+				self::prepare_identity_recovery();
+				$bootstrap = self::bootstrap_if_needed(true);
+				if(is_array($bootstrap) && trim(self::setting('forumfortress_api_key')) !== '')
+				{
+					$payload['api_key'] = self::setting('forumfortress_api_key');
+					$payload['site_id'] = self::setting('forumfortress_site_id');
+					$payload['domain'] = self::domain();
+					return self::request($method, $path, $payload, $control, $timeout, false);
+				}
+				// A regional edge can briefly reject a valid key while propagation
+				// catches up. Do not strand a synced/registered forum by erasing its
+				// last known identity when the cautious control-plane recovery gate
+				// correctly refuses to mint a replacement.
+				self::save_setting('forumfortress_api_key', $previous_key);
+				self::save_setting('forumfortress_site_id', $previous_site);
+				self::rebuild_settings_cache();
+				return null;
+			}
 			if(!self::should_failover()) break;
 		}
 		return null;
+	}
+	protected static function response_error_code()
+	{
+		$data = isset(self::$request_meta['data']) && is_array(self::$request_meta['data']) ? self::$request_meta['data'] : array();
+		$detail = isset($data['detail']) ? $data['detail'] : null;
+		if(isset($data['error'])) return strtolower(trim((string)$data['error']));
+		if(is_array($detail) && isset($detail['error'])) return strtolower(trim((string)$detail['error']));
+		return is_string($detail) ? strtolower(trim($detail)) : '';
+	}
+	protected static function should_rebootstrap($path)
+	{
+		if($path === '/v1/site/bootstrap' || trim(self::setting('forumfortress_api_key')) === '') return false;
+		$status = isset(self::$request_meta['status']) ? (int)self::$request_meta['status'] : 0;
+		$code = self::response_error_code();
+		if($status === 409 && $code === 'stale_site') return true;
+		return $status === 401 && in_array($code, array('invalid_key', 'invalid_api_key', 'unknown_site', 'invalid_key_format', 'site_not_found'), true);
+	}
+	protected static function prepare_identity_recovery()
+	{
+		$code = self::response_error_code();
+		if($code === 'stale_site')
+		{
+			self::save_setting('forumfortress_site_id', '');
+		}
+		else
+		{
+			self::save_setting('forumfortress_api_key', '');
+			self::save_setting('forumfortress_site_id', '');
+		}
+		$state = self::state(); unset($state['last_bootstrap_failure_at'], $state['last_bootstrap_error']); self::save_state($state); self::rebuild_settings_cache();
 	}
 	protected static function raw_request($method, $base, $path, $payload, $authenticate, $timeout=null)
 	{
@@ -762,7 +847,7 @@ class ForumFortressMyBB
 			if(isset($http_response_header[0]) && preg_match('/\s([0-9]{3})\s/', $http_response_header[0], $match)) $status = (int)$match[1];
 		}
 		$data = is_string($raw) ? json_decode($raw, true) : null;
-		self::$request_meta = array('status' => $status, 'valid_json' => is_array($data));
+		self::$request_meta = array('status' => $status, 'valid_json' => is_array($data), 'data' => is_array($data) ? $data : array());
 		if($status < 200 || $status >= 300 || !is_array($data)) return null;
 		return $data;
 	}
@@ -821,9 +906,31 @@ class ForumFortressMyBB
 		$db->insert_query('forumfortress_events', array('dateline' => time(), 'endpoint' => $db->escape_string($endpoint), 'decision' => $db->escape_string($decision), 'username' => $db->escape_string((string)$username), 'remote_id' => $db->escape_string((string)$remote), 'reason' => $db->escape_string(substr($reason, 0, 255))));
 	}
 	// These public diagnostics deliberately run without a site key so the ACP can diagnose first-time bootstrap.
-	public static function health() { return self::raw_request('GET', self::api_base_url(), '/health', array(), false, 2); }
-	public static function capabilities() { return self::raw_request('GET', self::setting('forumfortress_control_base_url'), '/v1/capabilities', array(), false, 2); }
+	public static function health()
+	{
+		$region = self::api_region();
+		$bases = array(self::api_base_url());
+		if($region !== 'global' && self::allow_global_emergency_fallback()) $bases[] = 'https://api.ffapi.net';
+		foreach($bases as $base)
+		{
+			$health = self::raw_request('GET', $base, '/health', array(), false, 2);
+			if(is_array($health)) return $health;
+		}
+		return null;
+	}
+	public static function capabilities() { return self::raw_request('GET', self::control_base_url(), '/v1/capabilities', array(), false, 2); }
 	public static function site_status() { return trim(self::setting('forumfortress_api_key')) === '' ? array() : self::request('GET', '/v1/site/status', array()); }
+	public static function site_ping($timeout=2)
+	{
+		if(trim(self::setting('forumfortress_api_key')) === '' || trim(self::setting('forumfortress_site_id')) === '') return null;
+		$response = self::request('POST', '/v1/site/ping', array(), true, $timeout);
+		if(is_array($response))
+		{
+			$state = self::state(); $state['last_site_ping_at'] = time(); unset($state['last_site_ping_attempt_at']); self::save_state($state); self::rebuild_settings_cache();
+			self::persist_identity($response, self::control_base_url());
+		}
+		return $response;
+	}
 	public static function connection_test() { $boot = self::bootstrap_if_needed(); return array('bootstrap' => $boot ? 'ok' : (self::setting('forumfortress_api_key') ? 'already_configured' : 'no_response'), 'health' => self::health() ? 'ok' : 'no_response', 'capabilities' => self::capabilities() ? 'ok' : 'no_response', 'site_status' => self::site_status() ? 'ok' : 'no_response', 'state' => self::state()); }
 	public static function deprovision($api_key, $site_id, $domain)
 	{
@@ -865,7 +972,7 @@ class ForumFortressMyBB
 		$parts = @parse_url($value);
 		if(
 			!is_array($parts)
-			|| !in_array(strtolower((string)(isset($parts['scheme']) ? $parts['scheme'] : '')), array('http', 'https'), true)
+			|| strtolower((string)(isset($parts['scheme']) ? $parts['scheme'] : '')) !== 'https'
 			|| trim((string)(isset($parts['host']) ? $parts['host'] : '')) === ''
 			|| !empty($parts['user']) || !empty($parts['pass']) || !empty($parts['fragment'])
 		)
