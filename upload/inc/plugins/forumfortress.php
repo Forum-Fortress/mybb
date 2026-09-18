@@ -11,7 +11,7 @@ if(!defined('IN_MYBB'))
 	die('This file cannot be accessed directly.');
 }
 
-define('FORUMFORTRESS_MYBB_VERSION', '1.2.0');
+define('FORUMFORTRESS_MYBB_VERSION', '1.2.1');
 
 global $plugins;
 if(isset($plugins))
@@ -459,7 +459,7 @@ function forumfortress_settings_gid()
 
 class ForumFortressMyBB
 {
-	const CONTROL_BASE_URL = 'https://fortress.ffapi.net';
+	const CONTROL_BASE_URL = 'https://api.ffapi.net';
 	const STANDARD_HEARTBEAT_INTERVAL_SECONDS = 3600;
 	const PRO_HEARTBEAT_INTERVAL_SECONDS = 600;
 	protected static $request_meta = array();

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1 - 2026-09-18
+
+- Route lifecycle and bootstrap requests through the resilient public API path.
+
 ## 1.2.0 - 2026-09-11
 
 - Replace health and endpoint-catalogue routing with deterministic GeoDNS
