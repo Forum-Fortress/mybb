@@ -11,7 +11,7 @@ if(!defined('IN_MYBB'))
 	die('This file cannot be accessed directly.');
 }
 
-define('FORUMFORTRESS_MYBB_VERSION', '1.2.1');
+define('FORUMFORTRESS_MYBB_VERSION', '1.2.2');
 
 global $plugins;
 if(isset($plugins))
@@ -29,6 +29,8 @@ if(isset($plugins))
 	{
 		$plugins->add_hook('admin_config_menu', 'forumfortress_admin_menu');
 		$plugins->add_hook('admin_config_plugins_begin', 'forumfortress_admin_page');
+		$plugins->add_hook('admin_config_settings_begin', 'forumfortress_admin_settings');
+		$plugins->add_hook('admin_formcontainer_output_row', 'forumfortress_admin_setting_row');
 	}
 }
 
@@ -86,11 +88,12 @@ function forumfortress_install()
 	$db->delete_query('settings', "name='forumfortress_control_base_url'");
 	$settings = array(
 		'forumfortress_enabled' => array('Enabled', 'Enable Forum Fortress checks and background bootstrap.', 'yesno', '1'),
+		'forumfortress_repeat_ban' => array('Ban repeat spammers for seven days', 'Off by default. Two distinct server-certified spam blocks within 24 hours can ban a new, low-trust member. Requires the installed Forum Fortress native task. Administrators, moderators and established members are protected.', 'yesno', '0'),
 		'forumfortress_api_region' => array('API region', 'Lock check traffic to a region, or use the recommended global network.', "select\nglobal=Global - Recommended\nuk=United Kingdom only\neu=European Union only\nus=United States only", $legacy_region),
 		'forumfortress_allow_global_fallback' => array('Allow global emergency fallback', 'After a regional retry fails, permit the global network. Processing may occur outside the selected region.', 'yesno', '0'),
 		'forumfortress_timeout' => array('Request timeout', 'Maximum API request time in seconds (1–30).', 'numeric', '5'),
 		'forumfortress_fail_open' => array('Fail open', 'Allow an action when Forum Fortress is unavailable. Disable only when your forum can tolerate API outages blocking registrations and content.', 'yesno', '1'),
-		'forumfortress_api_key' => array('API key', 'Stored automatically after anonymous bootstrap, or paste a live key from Forum Fortress.', 'text', ''),
+		'forumfortress_api_key' => array('API key', 'Stored automatically after anonymous bootstrap. With the plugin active, paste a replacement key. Blank submissions preserve the stored key.', "php\n".'<input type=\"password\" name=\"upsetting[forumfortress_api_key_replacement]\" id=\"setting_forumfortress_api_key\" value=\"\" autocomplete=\"new-password\" />', ''),
 		'forumfortress_site_id' => array('Site ID', 'Stored automatically after bootstrap.', 'text', ''),
 		'forumfortress_endpoint_state' => array('Endpoint state', 'Internal diagnostics state. Do not edit manually.', 'textarea', '{}'),
 	);
@@ -103,6 +106,7 @@ function forumfortress_install()
 			'description' => $db->escape_string($setting[1]), 'optionscode' => $db->escape_string($setting[2]),
 			'value' => $db->escape_string($setting[3]), 'disporder' => $order, 'gid' => $gid,
 		);
+		if($name === 'forumfortress_api_key') $data['isdefault'] = 1; // Secure input metadata is maintained by the plugin.
 		$query = $db->simple_select('settings', 'sid', "name='{$data['name']}'");
 		$sid = (int)$db->fetch_field($query, 'sid');
 		if($sid)
@@ -130,6 +134,8 @@ function forumfortress_install()
 			PRIMARY KEY (eid), KEY dateline (dateline)
 		) ENGINE=MyISAM{$collation}");
 	}
+	ForumFortressMyBBIdentity::install();
+	ForumFortressMyBBRepeat::install();
 	rebuild_settings();
 }
 
@@ -144,6 +150,14 @@ function forumfortress_activate()
 	// Reconcile generated settings when an existing installation activates a
 	// newer plugin release, without touching its identity or audit table.
 	forumfortress_install();
+}
+
+function forumfortress_deactivate()
+{
+	global $db;
+	// A subsequent re-enable starts with fresh evidence, retaining action receipts.
+	if($db->table_exists('forumfortress_repeat_state')) $db->write_query('UPDATE '.TABLE_PREFIX.'forumfortress_repeat_state SET pending=0', 1);
+	if($db->table_exists('forumfortress_repeat_events')) $db->write_query('UPDATE '.TABLE_PREFIX.'forumfortress_repeat_events SET consumed=1', 1);
 }
 
 function forumfortress_uninstall()
@@ -167,6 +181,8 @@ function forumfortress_uninstall()
 	{
 		$db->drop_table('forumfortress_events');
 	}
+	ForumFortressMyBBRepeat::uninstall();
+	ForumFortressMyBBIdentity::uninstall();
 	rebuild_settings();
 }
 
@@ -203,6 +219,9 @@ function forumfortress_validate_user($handler)
 		$response = ForumFortressMyBB::check($endpoint, $payload);
 		$decision = ForumFortressMyBB::decision($response);
 		ForumFortressMyBB::event($endpoint, $decision, $payload, $response);
+		$actor = isset($mybb->user['uid']) ? (int)$mybb->user['uid'] : 0;
+		$owner = isset($handler->data['uid']) ? (int)$handler->data['uid'] : 0;
+		ForumFortressMyBBRepeat::record($owner, $actor, $response, isset($payload['content']) ? $payload['content'] : '');
 		if(ForumFortressMyBB::reject($response)) $handler->set_error('forumfortress_blocked');
 		return;
 	}
@@ -233,6 +252,8 @@ function forumfortress_validate_signature()
 	$response = ForumFortressMyBB::check('signature_edit', $payload);
 	$decision = ForumFortressMyBB::decision($response);
 	ForumFortressMyBB::event('signature_edit', $decision, $payload, $response);
+	$actor = isset($user['uid']) ? (int)$user['uid'] : 0;
+	ForumFortressMyBBRepeat::record($actor, $actor, $response, $signature);
 	if(ForumFortressMyBB::reject($response) && function_exists('error')) error('Forum Fortress rejected this signature.');
 }
 
@@ -286,6 +307,10 @@ function forumfortress_validate_post($handler, $forced_type='')
 	$response = ForumFortressMyBB::check($endpoint, $payload);
 	$decision = ForumFortressMyBB::decision($response);
 	ForumFortressMyBB::event($endpoint, $decision, $payload, $response);
+	$actor = isset($mybb->user['uid']) ? (int)$mybb->user['uid'] : 0;
+	$owner = isset($handler->data['uid']) ? (int)$handler->data['uid'] : 0;
+	$pid = $method === 'update' && isset($handler->data['pid']) ? (int)$handler->data['pid'] : 0;
+	if($method !== 'update' || $pid > 0) ForumFortressMyBBRepeat::record($owner, $actor, $response, isset($handler->data['message']) ? (string)$handler->data['message'] : '', $pid);
 	if(ForumFortressMyBB::reject($response))
 	{
 		$handler->set_error('forumfortress_blocked');
@@ -413,6 +438,15 @@ function forumfortress_admin_page()
 	$eventCount = 0;
 	while($row = $db->fetch_array($query)) { ++$eventCount; $decisionClass = $row['decision'] === 'allow' ? 'ffPill--ok' : ($row['decision'] === 'block' ? 'ffPill--warn' : 'ffPill--off'); echo '<tr><td>'.htmlspecialchars_uni(my_date('Y-m-d H:i:s', $row['dateline'])).'</td><td>'.htmlspecialchars_uni($row['endpoint']).'</td><td><span class="ffPill '.$decisionClass.'">'.htmlspecialchars_uni($row['decision']).'</span></td><td>'.htmlspecialchars_uni($row['username']).'</td><td>'.htmlspecialchars_uni($row['reason']).'</td></tr>'; }
 	if(!$eventCount) echo '<tr><td colspan="5" class="ffEmpty">No decisions recorded yet. Protection events will appear here as traffic reaches your forum.</td></tr>';
+	echo '</table></section>';
+	$attempts = ForumFortressMyBBRepeat::recent();
+	echo '<section class="ffCard"><div class="ffSectionHeader"><div><strong>Repeat-spammer bans</strong><span>Review or lift bans through native MyBB moderation. Failed or unconfirmed attempts require review and are never retried automatically.</span></div><a href="index.php?module=user-banning">Native bans</a></div><table class="ffTable">';
+	foreach($attempts as $attempt)
+	{
+		$label = $attempt['acted_at'] ? 'Applied' : ($attempt['failed'] ? 'Failed; review required' : 'Unconfirmed; review required');
+		echo '<tr><td><a href="index.php?module=user-users&amp;action=edit&amp;uid='.(int)$attempt['uid'].'">Member '.(int)$attempt['uid'].'</a></td><td>'.htmlspecialchars_uni(my_date('Y-m-d H:i:s', $attempt['attempted_at'])).'</td><td>'.htmlspecialchars_uni($label).'</td></tr>';
+	}
+	if(!$attempts) echo '<tr><td class="ffEmpty">No automatic ban attempts recorded.</td></tr>';
 	echo '</table></section></div>';
 	$page->output_footer(); exit;
 }
@@ -467,7 +501,7 @@ class ForumFortressMyBB
 	protected static $bootstrap_attempted = false;
 	protected static $authenticated_portal_url = NULL;
 
-	public static function setting($name, $default='') { global $mybb; return isset($mybb->settings[$name]) ? (string)$mybb->settings[$name] : $default; }
+	public static function setting($name, $default='') { global $mybb; if($name === 'forumfortress_api_key' && ForumFortressMyBBIdentity::ready()) return ForumFortressMyBBIdentity::value(); return isset($mybb->settings[$name]) ? (string)$mybb->settings[$name] : $default; }
 	public static function enabled() { return self::setting('forumfortress_enabled', '1') === '1'; }
 	public static function fail_open() { return self::setting('forumfortress_fail_open', '1') === '1'; }
 	public static function timeout($cap=30) { return max(1, min((int)$cap, min(30, (int)self::setting('forumfortress_timeout', '5')))); }
@@ -544,6 +578,7 @@ class ForumFortressMyBB
 	protected static function save_setting($name, $value)
 	{
 		global $db, $mybb; $value = (string)$value;
+		if($name === 'forumfortress_api_key' && ForumFortressMyBBIdentity::ready()) { ForumFortressMyBBIdentity::save($value); $mybb->settings[$name] = ''; return; }
 		$db->update_query('settings', array('value' => $db->escape_string($value)), "name='".$db->escape_string($name)."'");
 		$mybb->settings[$name] = $value;
 	}
@@ -963,5 +998,395 @@ class ForumFortressMyBB
 		if(rtrim($path, '/') !== '/access') return false;
 		$query = array(); parse_str((string)(isset($parts['query']) ? $parts['query'] : ''), $query);
 		return isset($query['token']) && is_string($query['token']) && trim($query['token']) !== '';
+	}
+}
+
+/** Keep native ACP secret inputs write-only, including the metadata editor. */
+function forumfortress_admin_settings()
+{
+	global $mybb, $db, $lang;
+	if(isset($lang) && method_exists($lang, 'load')) $lang->load('forumfortress', false, true);
+	if($mybb->request_method !== 'post') return;
+	if(isset($mybb->input['upsetting']['forumfortress_api_key_replacement']))
+	{
+		$value = trim((string)$mybb->input['upsetting']['forumfortress_api_key_replacement']);
+		if($value !== '')
+		{
+			if(ForumFortressMyBBIdentity::ready()) ForumFortressMyBBIdentity::save($value);
+			else $mybb->input['upsetting']['forumfortress_api_key'] = $value;
+		}
+		unset($mybb->input['upsetting']['forumfortress_api_key_replacement']);
+	}
+	if(isset($mybb->input['upsetting']['forumfortress_api_key']) && trim((string)$mybb->input['upsetting']['forumfortress_api_key']) === '') unset($mybb->input['upsetting']['forumfortress_api_key']);
+	if(isset($mybb->input['upsetting']['forumfortress_api_key']) && ForumFortressMyBBIdentity::ready()) { ForumFortressMyBBIdentity::save((string)$mybb->input['upsetting']['forumfortress_api_key']); unset($mybb->input['upsetting']['forumfortress_api_key']); }
+	if(isset($mybb->input['action'], $mybb->input['sid'], $mybb->input['value']) && $mybb->input['action'] === 'edit' && trim((string)$mybb->input['value']) === '')
+	{
+		$q = $db->simple_select('settings', 'value', "name='forumfortress_api_key' AND sid=".(int)$mybb->input['sid']);
+		$value = $db->fetch_field($q, 'value');
+		if($value !== false) $mybb->input['value'] = $value;
+	}
+	if(isset($mybb->input['action'], $mybb->input['sid'], $mybb->input['value']) && $mybb->input['action'] === 'edit' && trim((string)$mybb->input['value']) !== '' && ForumFortressMyBBIdentity::ready())
+	{
+		$q = $db->simple_select('settings', 'name', "name='forumfortress_api_key' AND sid=".(int)$mybb->input['sid']);
+		if($db->fetch_field($q, 'name')) { ForumFortressMyBBIdentity::save((string)$mybb->input['value']); $mybb->input['value'] = ''; }
+	}
+}
+
+function forumfortress_admin_setting_row($row)
+{
+	global $setting, $form, $mybb, $lang;
+	if(!isset($row['content']) || !is_string($row['content'])) return $row;
+	$regular = strpos($row['content'], 'name="upsetting[forumfortress_api_key]"') !== false;
+	$metadata = isset($setting['name'], $mybb->input['action']) && $setting['name'] === 'forumfortress_api_key' && $mybb->input['action'] === 'edit' && strpos($row['content'], 'name="value"') !== false;
+	if($regular || $metadata)
+	{
+		$name = $regular ? 'upsetting[forumfortress_api_key]' : 'value';
+		$row['content'] = $form->generate_password_box($name, '', array('id' => $regular ? 'setting_forumfortress_api_key' : 'value', 'autocomplete' => 'new-password'));
+	}
+	if(strpos($row['content'], 'name="upsetting[forumfortress_repeat_ban]"') !== false && !ForumFortressMyBBRepeat::available())
+	{
+		$row['content'] = htmlspecialchars_uni(isset($lang->forumfortress_repeat_unavailable) ? $lang->forumfortress_repeat_unavailable : 'Unavailable: install and enable the Forum Fortress native task on a supported MySQL database.');
+	}
+	return $row;
+}
+
+/** Local evidence and separate native task; the content checker never bans. */
+class ForumFortressMyBBRepeat
+{
+	const WINDOW = 86400;
+	const DURATION = 604800;
+	private static $staged = array();
+	private static $shutdown = false;
+
+	private static function mysql()
+	{
+		global $db;
+		return isset($db->type) && in_array($db->type, array('mysql', 'mysqli', 'pdomysql'), true);
+	}
+	private static function table($name) { return '`'.str_replace('`', '``', TABLE_PREFIX.$name).'`'; }
+	private static function q($sql)
+	{
+		global $db;
+		$r = $db->write_query($sql, 1);
+		if($r === false) throw new RuntimeException('Optional repeat-spammer database operation failed.');
+		return $r;
+	}
+	private static function row($sql) { global $db; return $db->fetch_array(self::q($sql)); }
+
+	public static function install()
+	{
+		global $db, $cache;
+		if(!self::mysql()) return;
+		$collation = $db->build_create_table_collation();
+		try
+		{
+		if(!$db->table_exists('forumfortress_repeat_state')) $db->write_query('CREATE TABLE '.self::table('forumfortress_repeat_state')." (
+			uid int unsigned NOT NULL PRIMARY KEY, pending tinyint NOT NULL DEFAULT 0,
+			attempted_at int unsigned NOT NULL DEFAULT 0, acted_at int unsigned NOT NULL DEFAULT 0,
+			failed tinyint NOT NULL DEFAULT 0, last_seen_at int unsigned NOT NULL,
+			KEY pending (pending)
+		) ENGINE=InnoDB{$collation}", 1);
+		if(!$db->table_exists('forumfortress_repeat_events')) $db->write_query('CREATE TABLE '.self::table('forumfortress_repeat_events')." (
+			eid int unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, uid int unsigned NOT NULL,
+			body_hash char(64) NOT NULL, reference_hash char(64) NOT NULL,
+			observed_at int unsigned NOT NULL, consumed tinyint NOT NULL DEFAULT 0,
+			UNIQUE KEY body (uid, body_hash), UNIQUE KEY reference_id (uid, reference_hash), KEY observed (observed_at)
+		) ENGINE=InnoDB{$collation}", 1);
+		}
+		catch(Exception $ignored) { return; } // Optional schema must not break an Off upgrade.
+		if(!defined('MYBB_ROOT') || !is_file(MYBB_ROOT.'inc/tasks/forumfortress_repeat.php') || !$db->table_exists('tasks')) return;
+		require_once MYBB_ROOT.'inc/functions_task.php';
+		$q = $db->simple_select('tasks', 'tid', "file='forumfortress_repeat'");
+		if(!$db->fetch_field($q, 'tid'))
+		{
+			$task = array('title' => 'Forum Fortress repeat-spammer bans', 'description' => 'Process local opt-in seven-day native bans.', 'file' => 'forumfortress_repeat', 'minute' => '*', 'hour' => '*', 'day' => '*', 'month' => '*', 'weekday' => '*', 'enabled' => 1, 'logging' => 1, 'lastrun' => 0, 'locked' => 0);
+			$task['nextrun'] = fetch_next_run($task);
+			$db->insert_query('tasks', $task);
+			$cache->update_tasks();
+		}
+	}
+	public static function uninstall()
+	{
+		global $db, $cache;
+		foreach(array('forumfortress_repeat_events', 'forumfortress_repeat_state') as $table) if($db->table_exists($table)) $db->drop_table($table);
+		if($db->table_exists('tasks'))
+		{
+			$q = $db->simple_select('tasks', 'tid', "file='forumfortress_repeat'");
+			while($task = $db->fetch_array($q)) if($db->table_exists('tasklog')) $db->delete_query('tasklog', 'tid='.(int)$task['tid']);
+			$db->delete_query('tasks', "file='forumfortress_repeat'");
+			$cache->update_tasks();
+		}
+		// Native bans, original groups, accounts and moderator reversals remain.
+	}
+	public static function available()
+	{
+		global $db;
+		if(!self::mysql() || !defined('MYBB_ROOT') || !is_file(MYBB_ROOT.'inc/tasks/forumfortress_repeat.php') || !function_exists('add_shutdown') || !function_exists('ban_date2timestamp')) return false;
+		try
+		{
+			// The transaction boundary must be observable. Unsupported servers
+			// leave this optional feature unavailable rather than risking a commit
+			// of another extension's work.
+			if(!self::row('SELECT @@in_transaction AS active,@@autocommit AS automatic')) return false;
+			foreach(array('forumfortress_repeat_state', 'forumfortress_repeat_events') as $name)
+			{
+				$t = self::row('SHOW TABLE STATUS WHERE Name=\''.$db->escape_string(TABLE_PREFIX.$name).'\'');
+				if(!$t || strcasecmp($t['Engine'], 'InnoDB') !== 0) return false;
+			}
+			$task = self::row('SELECT enabled FROM '.self::table('tasks')." WHERE file='forumfortress_repeat' LIMIT 1");
+			$group = self::row('SELECT gid FROM '.self::table('usergroups').' WHERE isbannedgroup=1 AND cancp=0 AND canmodcp=0 AND issupermod=0 LIMIT 1');
+			return $task && (int)$task['enabled'] === 1 && $group;
+		}
+		catch(Exception $e) { return false; }
+	}
+	public static function reference($response)
+	{
+		if(!is_array($response) || !isset($response['escalation_eligible'], $response['decision']) || $response['escalation_eligible'] !== true || !is_string($response['decision']) || strtolower(trim($response['decision'])) !== 'block') return null;
+		if(isset($response['decision_reference']) && is_string($response['decision_reference']) && trim($response['decision_reference']) !== '' && strlen($response['decision_reference']) <= 256) return hash('sha256', 'reference:'.trim($response['decision_reference']));
+		$id = isset($response['decision_id']) ? $response['decision_id'] : null;
+		if((is_int($id) || is_string($id)) && ctype_digit((string)$id) && strlen((string)$id) <= 32 && ltrim((string)$id, '0') !== '') return hash('sha256', 'decision:'.ltrim((string)$id, '0'));
+		return null;
+	}
+	public static function record($uid, $actor, $response, $body, $pid=0)
+	{
+		$reference = self::reference($response);
+		if(!ForumFortressMyBB::enabled() || ForumFortressMyBB::setting('forumfortress_repeat_ban', '0') !== '1' || (int)$uid <= 1 || (int)$uid !== (int)$actor || !$reference || trim((string)$body) === '' || count(self::$staged) >= 16 || !function_exists('add_shutdown')) return;
+		self::$staged[] = array((int)$uid, $reference, hash('sha256', trim((string)$body)), (int)$pid);
+		if(!self::$shutdown) { add_shutdown(array(__CLASS__, 'flush')); self::$shutdown = true; }
+	}
+	private static function enabled()
+	{
+		global $db;
+		$q = self::q('SELECT name,value FROM '.self::table('settings')." WHERE name IN ('forumfortress_enabled','forumfortress_repeat_ban')");
+		$settings = array(); while($row = $db->fetch_array($q)) $settings[$row['name']] = $row['value'];
+		$cache = self::row('SELECT cache FROM '.self::table('datacache')." WHERE title='plugins'");
+		$plugins = $cache && function_exists('native_unserialize') ? native_unserialize($cache['cache']) : null;
+		return is_array($plugins) && !empty($plugins['active']['forumfortress']) && isset($settings['forumfortress_enabled'], $settings['forumfortress_repeat_ban']) && $settings['forumfortress_enabled'] === '1' && $settings['forumfortress_repeat_ban'] === '1';
+	}
+	private static function eligible($user)
+	{
+		if(!$user || (int)$user['uid'] <= 1 || (int)$user['usergroup'] !== 2 || trim($user['additionalgroups']) !== '' || !in_array((int)$user['displaygroup'], array(0,2), true) || (int)$user['postnum'] > 10 || (int)$user['regdate'] <= time()-self::DURATION || (int)$user['regdate'] > time() || !empty($user['moderateposts']) || !empty($user['suspendposting']) || !empty($user['suspendsignature']) || is_super_admin($user['uid'])) return false;
+		$group = self::row('SELECT * FROM '.self::table('usergroups').' WHERE gid=2');
+		if(!$group) return false;
+		foreach(array('cancp','canmodcp','issupermod','canwarnusers','isbannedgroup') as $power) if(!empty($group[$power])) return false;
+		$uid = (int)$user['uid'];
+		if(self::row('SELECT uid FROM '.self::table('banned').' WHERE uid='.$uid.' LIMIT 1')) return false;
+		if(self::row('SELECT uid FROM '.self::table('adminoptions').' WHERE uid='.$uid.' LIMIT 1')) return false;
+		if(self::row('SELECT mid FROM '.self::table('moderators').' WHERE (isgroup=0 AND id='.$uid.') OR (isgroup=1 AND id=2) LIMIT 1')) return false;
+		return true;
+	}
+	public static function flush()
+	{
+		global $db;
+		$staged = self::$staged; self::$staged = array();
+		if(!$staged) return;
+		try
+		{
+			if(!self::available() || !self::enabled()) return;
+			$transaction = self::row('SELECT @@in_transaction AS active');
+			if(!$transaction || $transaction['active']) return; // Never commit another extension's transaction.
+			foreach($staged as $event)
+			{
+				list($uid, $reference, $body, $pid) = $event;
+				self::q('START TRANSACTION');
+				$now = time(); $state = self::table('forumfortress_repeat_state'); $events = self::table('forumfortress_repeat_events');
+				// Take an exclusive lock even on the duplicate path; INSERT IGNORE
+				// takes shared locks that can deadlock two subsequent FOR UPDATEs.
+				self::q("INSERT INTO $state (uid,last_seen_at) VALUES ($uid,$now) ON DUPLICATE KEY UPDATE uid=VALUES(uid)");
+				$row = self::row("SELECT * FROM $state WHERE uid=$uid FOR UPDATE");
+				$user = self::row('SELECT * FROM '.self::table('users').' WHERE uid='.$uid);
+				$owner = $pid ? self::row('SELECT uid FROM '.self::table('posts').' WHERE pid='.$pid) : null;
+				if(!$row || $row['attempted_at'] || !self::eligible($user) || !self::enabled() || ($pid && (!$owner || (int)$owner['uid'] !== $uid))) { self::q('ROLLBACK'); continue; }
+				self::q("UPDATE $events SET consumed=1 WHERE uid=$uid AND observed_at<=".($now-self::WINDOW));
+				$count = self::row("SELECT COUNT(*) AS total,SUM(consumed=0) AS recent FROM $events WHERE uid=$uid");
+				if((int)$count['total'] >= 128) { self::q('COMMIT'); continue; }
+				if((int)$count['recent'] < 2) self::q("INSERT IGNORE INTO $events (uid,body_hash,reference_hash,observed_at) VALUES ($uid,'$body','$reference',$now)");
+				$count = self::row("SELECT COUNT(*) AS recent FROM $events WHERE uid=$uid AND consumed=0");
+				$pending = (int)$count['recent'] >= 2 ? 1 : 0;
+				self::q("UPDATE $state SET pending=$pending,last_seen_at=$now WHERE uid=$uid");
+				self::q('COMMIT');
+			}
+		}
+		catch(Exception $e) { $db->write_query('ROLLBACK', 1); error_log('Forum Fortress repeat-spammer evidence could not be saved.'); }
+	}
+	public static function run($task)
+	{
+		global $db, $cache;
+		if(!is_array($task) || !isset($task['tid'], $task['file']) || $task['file'] !== 'forumfortress_repeat') throw new RuntimeException('Repeat enforcement requires a separate native task.');
+		$native = self::row('SELECT file,locked FROM '.self::table('tasks').' WHERE tid='.(int)$task['tid']);
+		if(!$native || $native['file'] !== 'forumfortress_repeat' || !$native['locked']) throw new RuntimeException('Repeat enforcement requires a separate native task.');
+		$transaction = self::row('SELECT @@in_transaction AS active,@@autocommit AS automatic');
+		if(!$transaction || $transaction['active'] || !$transaction['automatic']) throw new RuntimeException('Repeat enforcement requires a separate native task.');
+		$q = self::q('SELECT uid FROM '.self::table('forumfortress_repeat_state').' WHERE pending=1 ORDER BY uid LIMIT 50');
+		$ids = array(); while($row = $db->fetch_array($q)) $ids[] = (int)$row['uid'];
+		$applied = 0;
+		foreach($ids as $uid) if(self::apply($uid)) ++$applied;
+		self::prune();
+		if($applied) { $cache->update_moderators(); $cache->update_awaitingactivation(); }
+		return $applied;
+	}
+	public static function recent()
+	{
+		global $db;
+		$rows = array();
+		if(!$db->table_exists('forumfortress_repeat_state')) return $rows;
+		try
+		{
+			$q = self::q('SELECT uid,attempted_at,acted_at,failed FROM '.self::table('forumfortress_repeat_state').' WHERE attempted_at>0 ORDER BY attempted_at DESC LIMIT 15');
+			while($row = $db->fetch_array($q)) $rows[] = $row;
+		}
+		catch(Exception $ignored) {}
+		return $rows;
+	}
+	private static function apply($uid)
+	{
+		global $db;
+		$claimed = false; $applied = false; $user = null;
+		$state = self::table('forumfortress_repeat_state'); $events = self::table('forumfortress_repeat_events');
+		try
+		{
+			// MyBB 1.8's native users/banned tables may be MyISAM. Lock native
+			// account, staff, permission and settings tables across the whole action.
+			// COMMIT retains MySQL table locks until explicit UNLOCK TABLES.
+			self::q('SET autocommit=0');
+			$locks = array();
+			foreach(array('users','banned','forumfortress_repeat_state','forumfortress_repeat_events') as $name) $locks[] = self::table($name).' WRITE';
+			foreach(array('usergroups','moderators','adminoptions','settings','tasks','datacache') as $name) $locks[] = self::table($name).' READ';
+			self::q('LOCK TABLES '.implode(',', $locks));
+			$user = self::row('SELECT * FROM '.self::table('users').' WHERE uid='.$uid);
+			$work = self::row("SELECT * FROM $state WHERE uid=$uid");
+			$count = self::row("SELECT COUNT(*) AS recent FROM $events WHERE uid=$uid AND consumed=0 AND observed_at>".(time()-self::WINDOW));
+			$task = self::row('SELECT enabled FROM '.self::table('tasks')." WHERE file='forumfortress_repeat' LIMIT 1");
+			if($work && $work['pending'] && !$work['attempted_at'])
+			{
+				if(!self::enabled() || !$task || !$task['enabled'] || !is_file(MYBB_ROOT.'inc/tasks/forumfortress_repeat.php') || !self::eligible($user) || (int)$count['recent'] < 2)
+				{
+					self::q("UPDATE $state SET pending=0 WHERE uid=$uid");
+					self::q("UPDATE $events SET consumed=1 WHERE uid=$uid");
+					self::q('COMMIT');
+				}
+				else
+				{
+					$group = self::row('SELECT gid FROM '.self::table('usergroups').' WHERE isbannedgroup=1 AND cancp=0 AND canmodcp=0 AND issupermod=0 ORDER BY gid LIMIT 1');
+					if(!$group) throw new RuntimeException('No native banned group.');
+					$now = time(); $until = ban_date2timestamp('7-0-0', $now);
+					if(abs($until-$now-self::DURATION) > 60) throw new RuntimeException('Native seven-day duration unavailable.');
+					// Durable BEFORE native writes: MyISAM cannot roll back on a crash.
+					// A failed/ambiguous attempt requires moderator review, never a
+					// blind retry that could undo an intervening native reversal.
+					self::q("UPDATE $state SET pending=0,attempted_at=$now WHERE uid=$uid");
+					self::q("UPDATE $events SET consumed=1 WHERE uid=$uid");
+					self::q('COMMIT'); $claimed = true;
+					self::nativeBan($user, (int)$group['gid'], $now, $until);
+					self::q("UPDATE $state SET acted_at=$now WHERE uid=$uid");
+					self::q('COMMIT'); $applied = true;
+				}
+			}
+		}
+		catch(Exception $e)
+		{
+			$db->write_query('ROLLBACK', 1);
+			if($claimed && $user)
+			{
+				// Compensate a caught partial native write while native tables are
+				// still exclusively locked. Retain the pre-action receipt either way.
+				try
+				{
+					$db->update_query('users', array('usergroup'=>(int)$user['usergroup'],'additionalgroups'=>$db->escape_string($user['additionalgroups']),'displaygroup'=>(int)$user['displaygroup']), 'uid='.$uid);
+					$db->delete_query('banned', 'uid='.$uid);
+					self::q("UPDATE $state SET failed=1 WHERE uid=$uid"); self::q('COMMIT');
+				}
+				catch(Exception $ignored) {}
+			}
+			error_log('Forum Fortress repeat-spammer task failed for member '.$uid.($claimed ? '; native moderation review required.' : '; pending work retained.'));
+		}
+		$db->write_query('UNLOCK TABLES', 1); $db->write_query('SET autocommit=1', 1);
+		return $applied;
+	}
+	private static function nativeBan($user, $gid, $now, $until)
+	{
+		global $db;
+		// MyBB has no public ban service. Use the native Banning module's
+		// record/group format through its DB API; ACP lift and usercleanup own
+		// reversal/expiry. Existing accounts, posts and subscriptions are retained.
+		$db->insert_query('banned', array('uid'=>(int)$user['uid'],'gid'=>$gid,'oldgroup'=>(int)$user['usergroup'],'oldadditionalgroups'=>$db->escape_string($user['additionalgroups']),'olddisplaygroup'=>(int)$user['displaygroup'],'admin'=>0,'dateline'=>$now,'bantime'=>'7-0-0','lifted'=>$until,'reason'=>'Forum Fortress: two confirmed spam blocks within 24 hours.'));
+		$db->update_query('users', array('usergroup'=>$gid,'displaygroup'=>0,'additionalgroups'=>''), 'uid='.(int)$user['uid']);
+		$fresh = self::row('SELECT usergroup FROM '.self::table('users').' WHERE uid='.(int)$user['uid']);
+		$ban = self::row('SELECT lifted FROM '.self::table('banned').' WHERE uid='.(int)$user['uid']);
+		if(!$fresh || (int)$fresh['usergroup'] !== $gid || !$ban || (int)$ban['lifted'] !== $until) throw new RuntimeException('Native ban was not confirmed.');
+	}
+	private static function prune()
+	{
+		$events = self::table('forumfortress_repeat_events'); $state = self::table('forumfortress_repeat_state');
+		self::q("DELETE FROM $events WHERE observed_at<=".(time()-self::DURATION).' LIMIT 500');
+		self::q("DELETE FROM $state WHERE pending=0 AND attempted_at=0 AND last_seen_at<=".(time()-self::DURATION).' LIMIT 500');
+		self::q("DELETE FROM $state WHERE uid NOT IN (SELECT uid FROM ".self::table('users').') LIMIT 500');
+	}
+}
+
+/** The native setting metadata must never contain the current plaintext key. */
+class ForumFortressMyBBIdentity
+{
+	private static $present = null;
+	private static $value = null;
+	public static function ready()
+	{
+		global $db;
+		if(self::$present === null)
+		{
+			self::$present = false;
+			if(defined('MYBB_ROOT') && isset($db->type) && in_array($db->type, array('mysql','mysqli','pdomysql'), true) && $db->table_exists('forumfortress_identity'))
+			{
+				$q = $db->simple_select('forumfortress_identity', 'name', "name='api_key'");
+				self::$present = (bool)$db->fetch_field($q, 'name');
+			}
+		}
+		return self::$present;
+	}
+	public static function value()
+	{
+		global $db;
+		if(self::$value === null)
+		{
+			$q = $db->simple_select('forumfortress_identity', 'secret', "name='api_key'");
+			self::$value = (string)$db->fetch_field($q, 'secret');
+		}
+		return self::$value;
+	}
+	public static function save($value)
+	{
+		global $db, $mybb;
+		$db->update_query('forumfortress_identity', array('secret'=>$db->escape_string((string)$value)), "name='api_key'");
+		self::$value = (string)$value;
+		$db->update_query('settings', array('value'=>''), "name='forumfortress_api_key'");
+		$mybb->settings['forumfortress_api_key'] = '';
+	}
+	public static function install()
+	{
+		global $db, $mybb;
+		if(!defined('MYBB_ROOT') || !isset($db->type) || !in_array($db->type, array('mysql','mysqli','pdomysql'), true)) return;
+		try
+		{
+			if(!$db->table_exists('forumfortress_identity') && $db->write_query('CREATE TABLE '.TABLE_PREFIX.'forumfortress_identity (name varchar(24) NOT NULL PRIMARY KEY,secret text NOT NULL) ENGINE=InnoDB'.$db->build_create_table_collation(), 1) === false) return;
+		}
+		catch(Exception $ignored) { return; }
+		$q = $db->simple_select('forumfortress_identity', 'name', "name='api_key'");
+		if(!$db->fetch_field($q, 'name'))
+		{
+			$q = $db->simple_select('settings', 'value', "name='forumfortress_api_key'");
+			$old = (string)$db->fetch_field($q, 'value');
+			$db->insert_query('forumfortress_identity', array('name'=>'api_key','secret'=>$db->escape_string($old)));
+			// Confirm the durable copy before clearing legacy native metadata.
+			$q = $db->simple_select('forumfortress_identity', 'secret', "name='api_key'");
+			if((string)$db->fetch_field($q, 'secret') !== $old) throw new RuntimeException('Stored key migration could not be confirmed.');
+		}
+		$db->update_query('settings', array('value'=>''), "name='forumfortress_api_key'");
+		$mybb->settings['forumfortress_api_key'] = ''; self::$present = true; self::$value = null;
+	}
+	public static function uninstall()
+	{
+		global $db;
+		if($db->table_exists('forumfortress_identity')) $db->drop_table('forumfortress_identity');
+		self::$present = false; self::$value = null;
 	}
 }
