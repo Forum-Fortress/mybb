@@ -11,7 +11,7 @@ if(!defined('IN_MYBB'))
 	die('This file cannot be accessed directly.');
 }
 
-define('FORUMFORTRESS_MYBB_VERSION', '1.2.2');
+define('FORUMFORTRESS_MYBB_VERSION', '1.3.1');
 
 global $plugins;
 if(isset($plugins))
@@ -89,6 +89,7 @@ function forumfortress_install()
 	$settings = array(
 		'forumfortress_enabled' => array('Enabled', 'Enable Forum Fortress checks and background bootstrap.', 'yesno', '1'),
 		'forumfortress_repeat_ban' => array('Ban repeat spammers for seven days', 'Off by default. Two distinct server-certified spam blocks within 24 hours can ban a new, low-trust member. Requires the installed Forum Fortress native task. Administrators, moderators and established members are protected.', 'yesno', '0'),
+		'forumfortress_repeat_cleanup' => array('Also clean eligible public replies', 'Optional and off by default. Requires three distinct cleanup-eligible blocks within 24 hours and an account with five posts or fewer. After a confirmed seven-day ban, reversibly soft-delete up to five public replies in bounded task batches. Topic starters and private content are excluded. Use MyBB Deleted Posts to review or restore content.', 'yesno', '0'),
 		'forumfortress_api_region' => array('API region', 'Lock check traffic to a region, or use the recommended global network.', "select\nglobal=Global - Recommended\nuk=United Kingdom only\neu=European Union only\nus=United States only", $legacy_region),
 		'forumfortress_allow_global_fallback' => array('Allow global emergency fallback', 'After a regional retry fails, permit the global network. Processing may occur outside the selected region.', 'yesno', '0'),
 		'forumfortress_timeout' => array('Request timeout', 'Maximum API request time in seconds (1–30).', 'numeric', '5'),
@@ -156,7 +157,7 @@ function forumfortress_deactivate()
 {
 	global $db;
 	// A subsequent re-enable starts with fresh evidence, retaining action receipts.
-	if($db->table_exists('forumfortress_repeat_state')) $db->write_query('UPDATE '.TABLE_PREFIX.'forumfortress_repeat_state SET pending=0', 1);
+	if($db->table_exists('forumfortress_repeat_state')) $db->write_query("UPDATE ".TABLE_PREFIX."forumfortress_repeat_state SET pending=0,cleanup_pending=0,cleanup_status='cancelled' WHERE cleanup_pending=1", 1);
 	if($db->table_exists('forumfortress_repeat_events')) $db->write_query('UPDATE '.TABLE_PREFIX.'forumfortress_repeat_events SET consumed=1', 1);
 }
 
@@ -440,13 +441,16 @@ function forumfortress_admin_page()
 	if(!$eventCount) echo '<tr><td colspan="5" class="ffEmpty">No decisions recorded yet. Protection events will appear here as traffic reaches your forum.</td></tr>';
 	echo '</table></section>';
 	$attempts = ForumFortressMyBBRepeat::recent();
-	echo '<section class="ffCard"><div class="ffSectionHeader"><div><strong>Repeat-spammer bans</strong><span>Review or lift bans through native MyBB moderation. Failed or unconfirmed attempts require review and are never retried automatically.</span></div><a href="index.php?module=user-banning">Native bans</a></div><table class="ffTable">';
+	echo '<section class="ffCard"><div class="ffSectionHeader"><div><strong>Repeat-spammer actions</strong><span>Review or lift bans through native MyBB moderation. Cleaned replies remain in Deleted Posts and can be restored there. Failed or unconfirmed ban attempts are never retried automatically.</span></div><a href="index.php?module=user-banning">Native bans</a></div><table class="ffTable">';
 	foreach($attempts as $attempt)
 	{
 		$label = $attempt['acted_at'] ? 'Applied' : ($attempt['failed'] ? 'Failed; review required' : 'Unconfirmed; review required');
-		echo '<tr><td><a href="index.php?module=user-users&amp;action=edit&amp;uid='.(int)$attempt['uid'].'">Member '.(int)$attempt['uid'].'</a></td><td>'.htmlspecialchars_uni(my_date('Y-m-d H:i:s', $attempt['attempted_at'])).'</td><td>'.htmlspecialchars_uni($label).'</td></tr>';
+		$cleanup = (int)$attempt['cleanup_count'].' replies soft-deleted';
+		if(!empty($attempt['cleanup_skipped_count'])) $cleanup .= ', '.(int)$attempt['cleanup_skipped_count'].' skipped';
+		$cleanup .= ': '.(string)$attempt['cleanup_status'];
+		echo '<tr><td><a href="index.php?module=user-users&amp;action=edit&amp;uid='.(int)$attempt['uid'].'">Member '.(int)$attempt['uid'].'</a></td><td>'.htmlspecialchars_uni(my_date('Y-m-d H:i:s', $attempt['attempted_at'])).'</td><td>'.htmlspecialchars_uni($label).'</td><td>'.htmlspecialchars_uni($cleanup).'</td></tr>';
 	}
-	if(!$attempts) echo '<tr><td class="ffEmpty">No automatic ban attempts recorded.</td></tr>';
+	if(!$attempts) echo '<tr><td class="ffEmpty">No automatic repeat-spammer actions recorded.</td></tr>';
 	echo '</table></section></div>';
 	$page->output_footer(); exit;
 }
@@ -1043,7 +1047,7 @@ function forumfortress_admin_setting_row($row)
 		$name = $regular ? 'upsetting[forumfortress_api_key]' : 'value';
 		$row['content'] = $form->generate_password_box($name, '', array('id' => $regular ? 'setting_forumfortress_api_key' : 'value', 'autocomplete' => 'new-password'));
 	}
-	if(strpos($row['content'], 'name="upsetting[forumfortress_repeat_ban]"') !== false && !ForumFortressMyBBRepeat::available())
+	if((strpos($row['content'], 'name="upsetting[forumfortress_repeat_ban]"') !== false || strpos($row['content'], 'name="upsetting[forumfortress_repeat_cleanup]"') !== false) && !ForumFortressMyBBRepeat::available())
 	{
 		$row['content'] = htmlspecialchars_uni(isset($lang->forumfortress_repeat_unavailable) ? $lang->forumfortress_repeat_unavailable : 'Unavailable: install and enable the Forum Fortress native task on a supported MySQL database.');
 	}
@@ -1083,15 +1087,26 @@ class ForumFortressMyBBRepeat
 		if(!$db->table_exists('forumfortress_repeat_state')) $db->write_query('CREATE TABLE '.self::table('forumfortress_repeat_state')." (
 			uid int unsigned NOT NULL PRIMARY KEY, pending tinyint NOT NULL DEFAULT 0,
 			attempted_at int unsigned NOT NULL DEFAULT 0, acted_at int unsigned NOT NULL DEFAULT 0,
-			failed tinyint NOT NULL DEFAULT 0, last_seen_at int unsigned NOT NULL,
+			failed tinyint NOT NULL DEFAULT 0, cleanup_pending tinyint NOT NULL DEFAULT 0,
+			cleanup_cursor int unsigned NOT NULL DEFAULT 0, cleanup_count int unsigned NOT NULL DEFAULT 0, cleanup_skipped_count int unsigned NOT NULL DEFAULT 0,
+			cleanup_done_at int unsigned NOT NULL DEFAULT 0, cleanup_status varchar(16) NOT NULL DEFAULT 'not_requested', last_seen_at int unsigned NOT NULL,
 			KEY pending (pending)
+		) ENGINE=InnoDB{$collation}", 1);
+		foreach(array('cleanup_pending' => 'tinyint NOT NULL DEFAULT 0', 'cleanup_cursor' => 'int unsigned NOT NULL DEFAULT 0', 'cleanup_count' => 'int unsigned NOT NULL DEFAULT 0', 'cleanup_skipped_count' => 'int unsigned NOT NULL DEFAULT 0', 'cleanup_done_at' => 'int unsigned NOT NULL DEFAULT 0', 'cleanup_status' => "varchar(16) NOT NULL DEFAULT 'not_requested'") as $column => $definition)
+		{
+			if(!$db->field_exists($column, 'forumfortress_repeat_state')) $db->write_query('ALTER TABLE '.self::table('forumfortress_repeat_state')." ADD $column $definition", 1);
+		}
+		if(!$db->table_exists('forumfortress_repeat_cleanup')) $db->write_query('CREATE TABLE '.self::table('forumfortress_repeat_cleanup')." (
+			pid int unsigned NOT NULL PRIMARY KEY, uid int unsigned NOT NULL, status varchar(8) NOT NULL DEFAULT 'pending', cleaned_at int unsigned NOT NULL DEFAULT 0,
+			KEY member (uid, cleaned_at)
 		) ENGINE=InnoDB{$collation}", 1);
 		if(!$db->table_exists('forumfortress_repeat_events')) $db->write_query('CREATE TABLE '.self::table('forumfortress_repeat_events')." (
 			eid int unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, uid int unsigned NOT NULL,
 			body_hash char(64) NOT NULL, reference_hash char(64) NOT NULL,
-			observed_at int unsigned NOT NULL, consumed tinyint NOT NULL DEFAULT 0,
+			observed_at int unsigned NOT NULL, consumed tinyint NOT NULL DEFAULT 0, cleanup_eligible tinyint NOT NULL DEFAULT 0,
 			UNIQUE KEY body (uid, body_hash), UNIQUE KEY reference_id (uid, reference_hash), KEY observed (observed_at)
 		) ENGINE=InnoDB{$collation}", 1);
+		if(!$db->field_exists('cleanup_eligible', 'forumfortress_repeat_events')) $db->write_query('ALTER TABLE '.self::table('forumfortress_repeat_events').' ADD cleanup_eligible tinyint NOT NULL DEFAULT 0', 1);
 		}
 		catch(Exception $ignored) { return; } // Optional schema must not break an Off upgrade.
 		if(!defined('MYBB_ROOT') || !is_file(MYBB_ROOT.'inc/tasks/forumfortress_repeat.php') || !$db->table_exists('tasks')) return;
@@ -1108,7 +1123,7 @@ class ForumFortressMyBBRepeat
 	public static function uninstall()
 	{
 		global $db, $cache;
-		foreach(array('forumfortress_repeat_events', 'forumfortress_repeat_state') as $table) if($db->table_exists($table)) $db->drop_table($table);
+		foreach(array('forumfortress_repeat_cleanup', 'forumfortress_repeat_events', 'forumfortress_repeat_state') as $table) if($db->table_exists($table)) $db->drop_table($table);
 		if($db->table_exists('tasks'))
 		{
 			$q = $db->simple_select('tasks', 'tid', "file='forumfortress_repeat'");
@@ -1121,14 +1136,14 @@ class ForumFortressMyBBRepeat
 	public static function available()
 	{
 		global $db;
-		if(!self::mysql() || !defined('MYBB_ROOT') || !is_file(MYBB_ROOT.'inc/tasks/forumfortress_repeat.php') || !function_exists('add_shutdown') || !function_exists('ban_date2timestamp')) return false;
+		if(!self::mysql() || !defined('MYBB_ROOT') || !is_file(MYBB_ROOT.'inc/tasks/forumfortress_repeat.php') || !is_file(MYBB_ROOT.'inc/class_moderation.php') || !function_exists('forum_permissions') || !function_exists('get_forum') || !function_exists('add_shutdown') || !function_exists('ban_date2timestamp')) return false;
 		try
 		{
 			// The transaction boundary must be observable. Unsupported servers
 			// leave this optional feature unavailable rather than risking a commit
 			// of another extension's work.
 			if(!self::row('SELECT @@in_transaction AS active,@@autocommit AS automatic')) return false;
-			foreach(array('forumfortress_repeat_state', 'forumfortress_repeat_events') as $name)
+			foreach(array('forumfortress_repeat_state', 'forumfortress_repeat_events', 'forumfortress_repeat_cleanup') as $name)
 			{
 				$t = self::row('SHOW TABLE STATUS WHERE Name=\''.$db->escape_string(TABLE_PREFIX.$name).'\'');
 				if(!$t || strcasecmp($t['Engine'], 'InnoDB') !== 0) return false;
@@ -1141,7 +1156,8 @@ class ForumFortressMyBBRepeat
 	}
 	public static function reference($response)
 	{
-		if(!is_array($response) || !isset($response['escalation_eligible'], $response['decision']) || $response['escalation_eligible'] !== true || !is_string($response['decision']) || strtolower(trim($response['decision'])) !== 'block') return null;
+		if(!is_array($response) || !isset($response['decision']) || !is_string($response['decision']) || strtolower(trim($response['decision'])) !== 'block'
+			|| ((!isset($response['escalation_eligible']) || $response['escalation_eligible'] !== true) && (!isset($response['repeat_cleanup_eligible']) || $response['repeat_cleanup_eligible'] !== true))) return null;
 		if(isset($response['decision_reference']) && is_string($response['decision_reference']) && trim($response['decision_reference']) !== '' && strlen($response['decision_reference']) <= 256) return hash('sha256', 'reference:'.trim($response['decision_reference']));
 		$id = isset($response['decision_id']) ? $response['decision_id'] : null;
 		if((is_int($id) || is_string($id)) && ctype_digit((string)$id) && strlen((string)$id) <= 32 && ltrim((string)$id, '0') !== '') return hash('sha256', 'decision:'.ltrim((string)$id, '0'));
@@ -1151,8 +1167,18 @@ class ForumFortressMyBBRepeat
 	{
 		$reference = self::reference($response);
 		if(!ForumFortressMyBB::enabled() || ForumFortressMyBB::setting('forumfortress_repeat_ban', '0') !== '1' || (int)$uid <= 1 || (int)$uid !== (int)$actor || !$reference || trim((string)$body) === '' || count(self::$staged) >= 16 || !function_exists('add_shutdown')) return;
-		self::$staged[] = array((int)$uid, $reference, hash('sha256', trim((string)$body)), (int)$pid);
+		try { $cleanup_mode = self::cleanupMode(); } catch(Exception $e) { return; }
+		$certificate = $cleanup_mode ? 'repeat_cleanup_eligible' : 'escalation_eligible';
+		if(!isset($response[$certificate]) || $response[$certificate] !== true) return;
+		// A dual-certified assessment belongs only to the mode that collected
+		// it. Never reinterpret an inclusive cleanup certificate as a ban hint.
+		self::$staged[] = array((int)$uid, $reference, hash('sha256', trim((string)$body)), (int)$pid, (int)$cleanup_mode);
 		if(!self::$shutdown) { add_shutdown(array(__CLASS__, 'flush')); self::$shutdown = true; }
+	}
+	private static function cleanupMode()
+	{
+		$setting = self::row('SELECT value FROM '.self::table('settings')." WHERE name='forumfortress_repeat_cleanup'");
+		return $setting && $setting['value'] === '1';
 	}
 	private static function enabled()
 	{
@@ -1163,9 +1189,9 @@ class ForumFortressMyBBRepeat
 		$plugins = $cache && function_exists('native_unserialize') ? native_unserialize($cache['cache']) : null;
 		return is_array($plugins) && !empty($plugins['active']['forumfortress']) && isset($settings['forumfortress_enabled'], $settings['forumfortress_repeat_ban']) && $settings['forumfortress_enabled'] === '1' && $settings['forumfortress_repeat_ban'] === '1';
 	}
-	private static function eligible($user)
+	private static function eligible($user, $max_posts=10)
 	{
-		if(!$user || (int)$user['uid'] <= 1 || (int)$user['usergroup'] !== 2 || trim($user['additionalgroups']) !== '' || !in_array((int)$user['displaygroup'], array(0,2), true) || (int)$user['postnum'] > 10 || (int)$user['regdate'] <= time()-self::DURATION || (int)$user['regdate'] > time() || !empty($user['moderateposts']) || !empty($user['suspendposting']) || !empty($user['suspendsignature']) || is_super_admin($user['uid'])) return false;
+		if(!$user || (int)$user['uid'] <= 1 || (int)$user['usergroup'] !== 2 || trim($user['additionalgroups']) !== '' || !in_array((int)$user['displaygroup'], array(0,2), true) || (int)$user['postnum'] > $max_posts || (int)$user['regdate'] <= time()-self::DURATION || (int)$user['regdate'] > time() || !empty($user['moderateposts']) || !empty($user['suspendposting']) || !empty($user['suspendsignature']) || is_super_admin($user['uid'])) return false;
 		$group = self::row('SELECT * FROM '.self::table('usergroups').' WHERE gid=2');
 		if(!$group) return false;
 		foreach(array('cancp','canmodcp','issupermod','canwarnusers','isbannedgroup') as $power) if(!empty($group[$power])) return false;
@@ -1187,7 +1213,7 @@ class ForumFortressMyBBRepeat
 			if(!$transaction || $transaction['active']) return; // Never commit another extension's transaction.
 			foreach($staged as $event)
 			{
-				list($uid, $reference, $body, $pid) = $event;
+				list($uid, $reference, $body, $pid, $collection_mode) = $event;
 				self::q('START TRANSACTION');
 				$now = time(); $state = self::table('forumfortress_repeat_state'); $events = self::table('forumfortress_repeat_events');
 				// Take an exclusive lock even on the duplicate path; INSERT IGNORE
@@ -1196,13 +1222,16 @@ class ForumFortressMyBBRepeat
 				$row = self::row("SELECT * FROM $state WHERE uid=$uid FOR UPDATE");
 				$user = self::row('SELECT * FROM '.self::table('users').' WHERE uid='.$uid);
 				$owner = $pid ? self::row('SELECT uid FROM '.self::table('posts').' WHERE pid='.$pid) : null;
-				if(!$row || $row['attempted_at'] || !self::eligible($user) || !self::enabled() || ($pid && (!$owner || (int)$owner['uid'] !== $uid))) { self::q('ROLLBACK'); continue; }
+				$cleanup_mode = self::cleanupMode();
+				$max_posts = $cleanup_mode ? 5 : 10;
+				if((int)$cleanup_mode !== $collection_mode || !$row || $row['attempted_at'] || !self::eligible($user, $max_posts) || !self::enabled() || ($pid && (!$owner || (int)$owner['uid'] !== $uid))) { self::q('ROLLBACK'); continue; }
 				self::q("UPDATE $events SET consumed=1 WHERE uid=$uid AND observed_at<=".($now-self::WINDOW));
-				$count = self::row("SELECT COUNT(*) AS total,SUM(consumed=0) AS recent FROM $events WHERE uid=$uid");
+				$count = self::row("SELECT COUNT(*) AS total,SUM(consumed=0 AND cleanup_eligible=$collection_mode) AS recent FROM $events WHERE uid=$uid");
 				if((int)$count['total'] >= 128) { self::q('COMMIT'); continue; }
-				if((int)$count['recent'] < 2) self::q("INSERT IGNORE INTO $events (uid,body_hash,reference_hash,observed_at) VALUES ($uid,'$body','$reference',$now)");
-				$count = self::row("SELECT COUNT(*) AS recent FROM $events WHERE uid=$uid AND consumed=0");
-				$pending = (int)$count['recent'] >= 2 ? 1 : 0;
+				$threshold = $cleanup_mode ? 3 : 2;
+				if((int)$count['recent'] < $threshold) self::q("INSERT IGNORE INTO $events (uid,body_hash,reference_hash,observed_at,cleanup_eligible) VALUES ($uid,'$body','$reference',$now,$collection_mode)");
+				$count = self::row("SELECT COUNT(*) AS recent FROM $events WHERE uid=$uid AND consumed=0 AND cleanup_eligible=$collection_mode");
+				$pending = (int)$count['recent'] >= $threshold ? 1 : 0;
 				self::q("UPDATE $state SET pending=$pending,last_seen_at=$now WHERE uid=$uid");
 				self::q('COMMIT');
 			}
@@ -1217,13 +1246,27 @@ class ForumFortressMyBBRepeat
 		if(!$native || $native['file'] !== 'forumfortress_repeat' || !$native['locked']) throw new RuntimeException('Repeat enforcement requires a separate native task.');
 		$transaction = self::row('SELECT @@in_transaction AS active,@@autocommit AS automatic');
 		if(!$transaction || $transaction['active'] || !$transaction['automatic']) throw new RuntimeException('Repeat enforcement requires a separate native task.');
-		$q = self::q('SELECT uid FROM '.self::table('forumfortress_repeat_state').' WHERE pending=1 ORDER BY uid LIMIT 50');
+		// MyBB's task timestamp is not an atomic claim. A connection-scoped
+		// mutex also serializes simultaneous native task invocations and is
+		// automatically released when a worker exits or crashes.
+		$database = self::row('SELECT DATABASE() AS name');
+		$lock = 'ff_repeat_'.substr(hash('sha256', $database['name'].TABLE_PREFIX), 0, 40);
+		$claim = self::row("SELECT GET_LOCK('$lock',0) AS acquired");
+		if(!$claim || (int)$claim['acquired'] !== 1) return 0;
+		try {
+		if(!self::enabled() || !self::cleanupMode()) self::q("UPDATE ".self::table('forumfortress_repeat_state')." SET cleanup_pending=0,cleanup_status='cancelled' WHERE cleanup_pending=1");
+		$q = self::q('SELECT uid,pending FROM '.self::table('forumfortress_repeat_state').' WHERE pending=1 OR cleanup_pending=1 ORDER BY uid LIMIT 50');
 		$ids = array(); while($row = $db->fetch_array($q)) $ids[] = (int)$row['uid'];
 		$applied = 0;
-		foreach($ids as $uid) if(self::apply($uid)) ++$applied;
+		foreach($ids as $uid)
+		{
+			if(self::row('SELECT pending FROM '.self::table('forumfortress_repeat_state').' WHERE uid='.$uid.' AND pending=1')) { if(self::apply($uid)) ++$applied; }
+			else self::clean($uid);
+		}
 		self::prune();
 		if($applied) { $cache->update_moderators(); $cache->update_awaitingactivation(); }
 		return $applied;
+		} finally { $db->write_query("SELECT RELEASE_LOCK('$lock')", 1); }
 	}
 	public static function recent()
 	{
@@ -1232,11 +1275,112 @@ class ForumFortressMyBBRepeat
 		if(!$db->table_exists('forumfortress_repeat_state')) return $rows;
 		try
 		{
-			$q = self::q('SELECT uid,attempted_at,acted_at,failed FROM '.self::table('forumfortress_repeat_state').' WHERE attempted_at>0 ORDER BY attempted_at DESC LIMIT 15');
+			$q = self::q('SELECT uid,attempted_at,acted_at,failed,cleanup_pending,cleanup_count,cleanup_skipped_count,cleanup_done_at,cleanup_status FROM '.self::table('forumfortress_repeat_state').' WHERE attempted_at>0 ORDER BY attempted_at DESC LIMIT 15');
 			while($row = $db->fetch_array($q)) $rows[] = $row;
 		}
 		catch(Exception $ignored) {}
 		return $rows;
+	}
+	private static function clean($uid)
+	{
+		global $db;
+		$uid = (int)$uid;
+		$state = self::table('forumfortress_repeat_state');
+		$receipts = self::table('forumfortress_repeat_cleanup');
+		try
+		{
+			// The native task lock serializes Forum Fortress runs. Re-read both
+			// administrator controls and the native ban immediately before use.
+			if(!self::available() || !self::enabled() || !self::cleanupMode()) return;
+			$work = self::row("SELECT * FROM $state WHERE uid=$uid AND cleanup_pending=1");
+			$user = self::row('SELECT * FROM '.self::table('users').' WHERE uid='.$uid);
+			$ban = self::row('SELECT * FROM '.self::table('banned').' WHERE uid='.$uid);
+			$evidence = self::row('SELECT COUNT(*) AS total FROM '.self::table('forumfortress_repeat_events').' WHERE uid='.$uid.' AND consumed=1 AND cleanup_eligible=1 AND observed_at>'.(time()-self::WINDOW));
+			if(!$work || !(int)$work['acted_at'] || !$user || !$ban || !$evidence || (int)$evidence['total'] < 3
+				|| (int)$ban['dateline'] !== (int)$work['acted_at'] || (int)$ban['lifted'] <= time()
+				|| $ban['reason'] !== 'Forum Fortress: three confirmed cleanup blocks within 24 hours.'
+				|| (int)$user['usergroup'] !== (int)$ban['gid'] || trim((string)$user['additionalgroups']) !== '' || (int)$user['displaygroup'] !== 0
+				|| (int)$ban['oldgroup'] !== 2 || trim((string)$ban['oldadditionalgroups']) !== '' || (int)$user['postnum'] > 5 || (int)$user['regdate'] <= time()-self::DURATION || (int)$user['regdate'] > time() || is_super_admin($uid) || self::row('SELECT uid FROM '.self::table('adminoptions').' WHERE uid='.$uid.' LIMIT 1') || self::row('SELECT mid FROM '.self::table('moderators').' WHERE (isgroup=0 AND id='.$uid.') OR (isgroup=1 AND id IN (2,'.(int)$user['usergroup'].')) LIMIT 1'))
+			{
+				self::q("UPDATE $state SET cleanup_pending=0,cleanup_status='skipped' WHERE uid=$uid");
+				return;
+			}
+			$group = self::row('SELECT isbannedgroup,cancp,canmodcp,issupermod,canwarnusers FROM '.self::table('usergroups').' WHERE gid='.(int)$user['usergroup']);
+			if(!$group || empty($group['isbannedgroup']) || !empty($group['cancp']) || !empty($group['canmodcp']) || !empty($group['issupermod']) || !empty($group['canwarnusers']))
+			{
+				self::q("UPDATE $state SET cleanup_pending=0,cleanup_status='skipped' WHERE uid=$uid");
+				return;
+			}
+			if(!defined('MYBB_ROOT') || !is_file(MYBB_ROOT.'inc/class_moderation.php') || !function_exists('forum_permissions') || !function_exists('get_forum')) return;
+			require_once MYBB_ROOT.'inc/class_moderation.php';
+			if(!class_exists('Moderation') || !method_exists('Moderation', 'soft_delete_posts')) return;
+			// A pending receipt can mean the process stopped around the native
+			// write. Recover posts still hidden; treat visible posts as ambiguous
+			// so a moderator-restored post is never deleted again.
+			$pending = self::q("SELECT r.pid,p.visible,p.uid FROM $receipts r LEFT JOIN ".self::table('posts')." p ON p.pid=r.pid WHERE r.uid=$uid AND r.status='pending'");
+			$now = time();
+			while($receipt = $db->fetch_array($pending))
+			{
+				if(isset($receipt['uid']) && (int)$receipt['uid'] === $uid && (int)$receipt['visible'] === -1) self::q("UPDATE $receipts SET status='cleaned',cleaned_at=$now WHERE pid=".(int)$receipt['pid']." AND status='pending'");
+				else self::q("UPDATE $receipts SET status='skipped' WHERE pid=".(int)$receipt['pid']." AND status='pending'");
+			}
+			$cleaned_total = self::row("SELECT COUNT(*) AS total FROM $receipts WHERE uid=$uid AND status='cleaned'");
+			$cleaned = $cleaned_total ? (int)$cleaned_total['total'] : (int)$work['cleanup_count'];
+			$remaining = max(0, 5 - $cleaned);
+			if(!$remaining)
+			{
+				$skipped = self::row("SELECT COUNT(*) AS total FROM $receipts WHERE uid=$uid AND status='skipped'");
+				self::q("UPDATE $state SET cleanup_pending=0,cleanup_skipped_count=".(int)$skipped['total'].",cleanup_done_at=".time().",cleanup_status='completed' WHERE uid=$uid");
+				return;
+			}
+			$cursor = (int)$work['cleanup_cursor'];
+			$q = self::q("SELECT p.pid,p.fid FROM ".self::table('posts')." p INNER JOIN ".self::table('threads')." t ON t.tid=p.tid LEFT JOIN $receipts r ON r.pid=p.pid WHERE p.uid=$uid AND p.pid>$cursor AND p.visible=1 AND t.visible=1 AND t.firstpost<>p.pid AND r.pid IS NULL ORDER BY p.pid LIMIT 100");
+			$candidates = array(); $scanned = $cursor;
+			while($post = $db->fetch_array($q))
+			{
+				$pid = (int)$post['pid']; $scanned = $pid;
+				$permissions = forum_permissions((int)$post['fid'], 0, 1); // Evaluate native guest-group permissions.
+				$forum = get_forum((int)$post['fid']);
+				if(!is_array($permissions) || empty($permissions['canview']) || empty($permissions['canviewthreads']) || !empty($permissions['canonlyviewownthreads']) || !$forum || $forum['type'] !== 'f' || !empty($forum['password'])) continue;
+				$parent_ids = array_filter(explode(',', (string)$forum['parentlist']));
+				$has_passworded_parent = false;
+				foreach($parent_ids as $parent_id) if((int)$parent_id !== (int)$post['fid']) { $parent = get_forum((int)$parent_id); if(!$parent || !empty($parent['password'])) { $has_passworded_parent = true; break; } }
+				if($has_passworded_parent) continue;
+				$candidates[] = $pid;
+				if(count($candidates) >= $remaining) break;
+			}
+			if(!$candidates)
+			{
+				$more = self::row("SELECT p.pid FROM ".self::table('posts')." p INNER JOIN ".self::table('threads')." t ON t.tid=p.tid LEFT JOIN $receipts r ON r.pid=p.pid WHERE p.uid=$uid AND p.pid>$scanned AND p.visible=1 AND t.visible=1 AND t.firstpost<>p.pid AND r.pid IS NULL ORDER BY p.pid LIMIT 1");
+				$done = $more ? 0 : 1;
+				$skipped = self::row("SELECT COUNT(*) AS total FROM $receipts WHERE uid=$uid AND status='skipped'");
+				$cleaned_total = self::row("SELECT COUNT(*) AS total FROM $receipts WHERE uid=$uid AND status='cleaned'");
+				self::q("UPDATE $state SET cleanup_cursor=$scanned,cleanup_count=".(int)$cleaned_total['total'].',cleanup_skipped_count='.(int)$skipped['total'].',cleanup_pending='.($done ? 0 : 1).',cleanup_done_at='.($done ? time() : 0).",cleanup_status='".($done ? 'completed' : 'queued')."' WHERE uid=$uid");
+				return;
+			}
+			// Persist retry receipts before the native non-transactional operation.
+			self::q("UPDATE $state SET cleanup_status='running' WHERE uid=$uid");
+			foreach($candidates as $pid) self::q("INSERT IGNORE INTO $receipts (pid,uid,status,cleaned_at) VALUES ($pid,$uid,'pending',0)");
+			// MyBB 1.8 soft_delete_posts preserves a restoration path and updates
+			// forum/thread/member counters. Its first-post behavior hides a whole
+			// thread, so candidates above explicitly exclude every topic starter.
+			$moderation = new Moderation();
+			$moderation->soft_delete_posts($candidates);
+			$now = time();
+			self::q("UPDATE $receipts r INNER JOIN ".self::table('posts')." p ON p.pid=r.pid SET r.status='cleaned',r.cleaned_at=$now WHERE r.uid=$uid AND r.status='pending' AND p.uid=$uid AND p.visible=-1");
+			$count = self::row("SELECT COUNT(*) AS total FROM $receipts WHERE uid=$uid AND status='cleaned'");
+			$unresolved = self::row('SELECT MIN(pid) AS pid FROM '.self::table('posts').' WHERE uid='.$uid.' AND pid IN ('.implode(',', $candidates).') AND visible=1');
+			$last = $unresolved && $unresolved['pid'] ? max($cursor, (int)$unresolved['pid']-1) : max($candidates);
+			$more = self::row("SELECT p.pid FROM ".self::table('posts')." p INNER JOIN ".self::table('threads')." t ON t.tid=p.tid LEFT JOIN $receipts r ON r.pid=p.pid WHERE p.uid=$uid AND p.pid>$last AND p.visible=1 AND t.visible=1 AND t.firstpost<>p.pid AND r.pid IS NULL ORDER BY p.pid LIMIT 1");
+			$done = ($unresolved && $unresolved['pid']) || $more ? 0 : 1;
+			$skipped = self::row("SELECT COUNT(*) AS total FROM $receipts WHERE uid=$uid AND status='skipped'");
+			self::q("UPDATE $state SET cleanup_cursor=$last,cleanup_count=".(int)$count['total'].',cleanup_skipped_count='.(int)$skipped['total'].',cleanup_pending='.($done ? 0 : 1).',cleanup_done_at='.($done ? $now : 0).",cleanup_status='".($done ? 'completed' : 'queued')."' WHERE uid=$uid");
+		}
+		catch(Exception $e)
+		{
+			try { self::q("UPDATE $state SET cleanup_status='failed' WHERE uid=$uid AND cleanup_pending=1"); } catch(Exception $ignored) {}
+			error_log('Forum Fortress repeat-spammer content cleanup failed for member '.$uid.'; native post restoration remains available.');
+		}
 	}
 	private static function apply($uid)
 	{
@@ -1255,11 +1399,13 @@ class ForumFortressMyBBRepeat
 			self::q('LOCK TABLES '.implode(',', $locks));
 			$user = self::row('SELECT * FROM '.self::table('users').' WHERE uid='.$uid);
 			$work = self::row("SELECT * FROM $state WHERE uid=$uid");
-			$count = self::row("SELECT COUNT(*) AS recent FROM $events WHERE uid=$uid AND consumed=0 AND observed_at>".(time()-self::WINDOW));
+			$cleanup_mode = self::cleanupMode();
+			$max_posts = $cleanup_mode ? 5 : 10;
+			$count = self::row("SELECT COUNT(*) AS recent FROM $events WHERE uid=$uid AND consumed=0 AND cleanup_eligible=".(int)$cleanup_mode.' AND observed_at>'.(time()-self::WINDOW));
 			$task = self::row('SELECT enabled FROM '.self::table('tasks')." WHERE file='forumfortress_repeat' LIMIT 1");
 			if($work && $work['pending'] && !$work['attempted_at'])
 			{
-				if(!self::enabled() || !$task || !$task['enabled'] || !is_file(MYBB_ROOT.'inc/tasks/forumfortress_repeat.php') || !self::eligible($user) || (int)$count['recent'] < 2)
+				if(!self::enabled() || !$task || !$task['enabled'] || !is_file(MYBB_ROOT.'inc/tasks/forumfortress_repeat.php') || !self::eligible($user, $max_posts) || (int)$count['recent'] < ($cleanup_mode ? 3 : 2))
 				{
 					self::q("UPDATE $state SET pending=0 WHERE uid=$uid");
 					self::q("UPDATE $events SET consumed=1 WHERE uid=$uid");
@@ -1277,8 +1423,9 @@ class ForumFortressMyBBRepeat
 					self::q("UPDATE $state SET pending=0,attempted_at=$now WHERE uid=$uid");
 					self::q("UPDATE $events SET consumed=1 WHERE uid=$uid");
 					self::q('COMMIT'); $claimed = true;
-					self::nativeBan($user, (int)$group['gid'], $now, $until);
-					self::q("UPDATE $state SET acted_at=$now WHERE uid=$uid");
+					self::nativeBan($user, (int)$group['gid'], $now, $until, $cleanup_mode);
+					$cleanup = $cleanup_mode ? 1 : 0;
+					self::q("UPDATE $state SET acted_at=$now,cleanup_pending=$cleanup,cleanup_status='".($cleanup ? 'queued' : 'not_requested')."' WHERE uid=$uid");
 					self::q('COMMIT'); $applied = true;
 				}
 			}
@@ -1303,13 +1450,14 @@ class ForumFortressMyBBRepeat
 		$db->write_query('UNLOCK TABLES', 1); $db->write_query('SET autocommit=1', 1);
 		return $applied;
 	}
-	private static function nativeBan($user, $gid, $now, $until)
+	private static function nativeBan($user, $gid, $now, $until, $cleanup_mode)
 	{
 		global $db;
 		// MyBB has no public ban service. Use the native Banning module's
 		// record/group format through its DB API; ACP lift and usercleanup own
 		// reversal/expiry. Existing accounts, posts and subscriptions are retained.
-		$db->insert_query('banned', array('uid'=>(int)$user['uid'],'gid'=>$gid,'oldgroup'=>(int)$user['usergroup'],'oldadditionalgroups'=>$db->escape_string($user['additionalgroups']),'olddisplaygroup'=>(int)$user['displaygroup'],'admin'=>0,'dateline'=>$now,'bantime'=>'7-0-0','lifted'=>$until,'reason'=>'Forum Fortress: two confirmed spam blocks within 24 hours.'));
+		$reason = $cleanup_mode ? 'Forum Fortress: three confirmed cleanup blocks within 24 hours.' : 'Forum Fortress: two confirmed spam blocks within 24 hours.';
+		$db->insert_query('banned', array('uid'=>(int)$user['uid'],'gid'=>$gid,'oldgroup'=>(int)$user['usergroup'],'oldadditionalgroups'=>$db->escape_string($user['additionalgroups']),'olddisplaygroup'=>(int)$user['displaygroup'],'admin'=>0,'dateline'=>$now,'bantime'=>'7-0-0','lifted'=>$until,'reason'=>$reason));
 		$db->update_query('users', array('usergroup'=>$gid,'displaygroup'=>0,'additionalgroups'=>''), 'uid='.(int)$user['uid']);
 		$fresh = self::row('SELECT usergroup FROM '.self::table('users').' WHERE uid='.(int)$user['uid']);
 		$ban = self::row('SELECT lifted FROM '.self::table('banned').' WHERE uid='.(int)$user['uid']);
