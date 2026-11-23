@@ -11,18 +11,15 @@ if(!defined('IN_MYBB'))
 	die('This file cannot be accessed directly.');
 }
 
-define('FORUMFORTRESS_MYBB_VERSION', '1.3.1');
+define('FORUMFORTRESS_MYBB_VERSION', '1.3.2');
 
 global $plugins;
 if(isset($plugins))
 {
 	$plugins->add_hook('global_start', 'forumfortress_background_bootstrap');
 	$plugins->add_hook('datahandler_user_validate', 'forumfortress_validate_user');
-	$plugins->add_hook('datahandler_user_insert_end', 'forumfortress_report_registration');
 	$plugins->add_hook('datahandler_post_validate_post', 'forumfortress_validate_post');
 	$plugins->add_hook('datahandler_post_validate_thread', 'forumfortress_validate_thread');
-	$plugins->add_hook('datahandler_post_insert_post_end', 'forumfortress_report_post');
-	$plugins->add_hook('datahandler_post_insert_thread_end', 'forumfortress_report_post');
 	$plugins->add_hook('usercp_do_editsig_start', 'forumfortress_validate_signature');
 	$plugins->add_hook('contact_do_start', 'forumfortress_validate_contact');
 	if(defined('IN_ADMINCP'))
@@ -206,6 +203,7 @@ function forumfortress_background_bootstrap()
 function forumfortress_validate_user($handler)
 {
 	global $mybb, $lang;
+	static $registration_checks;
 	if(!ForumFortressMyBB::enabled() || !is_object($handler) || !isset($handler->data) || !is_array($handler->data) || defined('IN_ADMINCP'))
 	{
 		return;
@@ -229,9 +227,22 @@ function forumfortress_validate_user($handler)
 	if(!isset($handler->method) || $handler->method !== 'insert' || empty($handler->data['registration'])) return;
 	$lang->userdata_forumfortress_blocked = 'Forum Fortress rejected this registration.';
 	$payload = ForumFortressMyBB::user_payload($handler->data);
-	$response = ForumFortressMyBB::check('register', $payload);
-	$decision = ForumFortressMyBB::decision($response);
-	ForumFortressMyBB::event('register', $decision, $payload, $response);
+	if($registration_checks === null)
+	{
+		$registration_checks = new SplObjectStorage();
+	}
+	$previous = isset($registration_checks[$handler]) ? $registration_checks[$handler] : null;
+	if($previous !== null && $previous['payload'] === $payload)
+	{
+		$response = $previous['response'];
+	}
+	else
+	{
+		$response = ForumFortressMyBB::check('register', $payload);
+		$decision = ForumFortressMyBB::decision($response);
+		ForumFortressMyBB::event('register', $decision, $payload, $response);
+		$registration_checks[$handler] = array('payload' => $payload, 'response' => $response);
+	}
 	if(ForumFortressMyBB::reject($response))
 	{
 		$handler->set_error('forumfortress_blocked');
@@ -256,22 +267,6 @@ function forumfortress_validate_signature()
 	$actor = isset($user['uid']) ? (int)$user['uid'] : 0;
 	ForumFortressMyBBRepeat::record($actor, $actor, $response, $signature);
 	if(ForumFortressMyBB::reject($response) && function_exists('error')) error('Forum Fortress rejected this signature.');
-}
-
-function forumfortress_report_registration($handler)
-{
-	if(!ForumFortressMyBB::enabled() || !is_object($handler) || !isset($handler->data) || !is_array($handler->data) || defined('IN_ADMINCP'))
-	{
-		return;
-	}
-	$payload = ForumFortressMyBB::user_payload($handler->data);
-	$uid = isset($handler->uid) ? $handler->uid : (isset($handler->data['uid']) ? $handler->data['uid'] : '');
-	$account = $payload;
-	unset($account['email']);
-	$report = $payload;
-	unset($report['email']);
-	$report['payload'] = array('remote_user_id' => (string)$uid, 'account' => $account);
-	ForumFortressMyBB::report('register', $report);
 }
 
 function forumfortress_validate_thread($handler)
@@ -317,31 +312,6 @@ function forumfortress_validate_post($handler, $forced_type='')
 		$handler->set_error('forumfortress_blocked');
 		return;
 	}
-}
-
-function forumfortress_report_post($handler)
-{
-	if(!ForumFortressMyBB::enabled() || !is_object($handler) || defined('IN_ADMINCP') || !ForumFortressMyBB::reportable_post($handler))
-	{
-		return;
-	}
-	$post = ForumFortressMyBB::post_payload($handler->data);
-	$payload = array(
-		'forum_id' => $post['forum_id'],
-		'username' => $post['username'],
-		'email_domain' => $post['email_domain'],
-		'ip' => $post['ip'],
-		'links' => $post['links'],
-		'content_hash' => sha1($post['content']),
-		'payload' => array(
-			'content' => $post['content'],
-			'subject' => isset($post['subject']) ? $post['subject'] : '',
-			'content_type' => (isset($handler->action) && $handler->action === 'thread') ? 'thread' : 'post',
-			'post_id' => (string)(isset($handler->pid) ? $handler->pid : (isset($post['content_id']) ? $post['content_id'] : '')),
-			'thread_id' => (string)(isset($handler->tid) ? $handler->tid : (isset($post['thread_id']) ? $post['thread_id'] : '')),
-		),
-	);
-	ForumFortressMyBB::report('moderation', $payload);
 }
 
 function forumfortress_validate_contact()
@@ -771,6 +741,12 @@ class ForumFortressMyBB
 		if(!self::enabled()) return null;
 		$allowed = array('register', 'login', 'topic', 'reply', 'profile', 'signature', 'contact_page', 'post_edit', 'reply_edit', 'topic_edit', 'signature_edit', 'profile_edit');
 		if(!in_array($endpoint, $allowed, true)) return null;
+		if($endpoint === 'register' && empty($payload['check_request_id']))
+		{
+			$payload['check_request_id'] = function_exists('random_bytes')
+				? bin2hex(random_bytes(16))
+				: substr(hash('sha256', uniqid('', true)), 0, 32);
+		}
 		self::bootstrap_if_needed();
 		return self::request('POST', '/v1/check/'.$endpoint, $payload, false, 5);
 	}
@@ -926,7 +902,6 @@ class ForumFortressMyBB
 	public static function email_domain($email) { $at = strrpos((string)$email, '@'); return $at === false ? '' : strtolower(substr($email, $at + 1)); }
 	public static function ip() { if(function_exists('get_ip')) return (string)get_ip(); return isset($_SERVER['REMOTE_ADDR']) ? (string)$_SERVER['REMOTE_ADDR'] : ''; }
 	public static function links($content) { preg_match_all('~https?://[^\\s<>"\']+~i', (string)$content, $matches); return array_values(array_unique(isset($matches[0]) ? $matches[0] : array())); }
-	public static function reportable_post($handler) { if(!is_object($handler) || !isset($handler->data) || !is_array($handler->data)) return false; $data = $handler->data; if(!empty($data['savedraft']) || (isset($data['visible']) && (string)$data['visible'] === '-2') || !empty($data['private']) || !empty($data['is_private']) || !empty($data['pm'])) return false; return true; }
 	public static function event($endpoint, $decision, $payload, $response)
 	{
 		global $db; if(!$db->table_exists('forumfortress_events')) return;

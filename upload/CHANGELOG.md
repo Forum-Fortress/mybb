@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.2 - 2026-11-23
+
+- Check each registration once. Reuse the result during repeated validation and
+  retain the request identity across connection retries.
+- Stop sending ordinary accepted posts/threads as `moderation` spam reports.
+  Validation still occurs before posting, while unconfirmed forum activity cannot
+  silently promote reputation; actual moderator verdict reporting is a separate
+  future integration.
+- Add hook-driven regressions for duplicate registration, post and thread events.
+- Verify native signup and upgrade on MyBB 1.8.41 with PHP 8.4 and MariaDB.
+
 ## 1.3.1 - 2026-10-14
 
 - Require three cleanup-certified blocks within 24 hours and five or fewer
