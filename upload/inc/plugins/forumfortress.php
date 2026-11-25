@@ -11,7 +11,9 @@ if(!defined('IN_MYBB'))
 	die('This file cannot be accessed directly.');
 }
 
-define('FORUMFORTRESS_MYBB_VERSION', '1.3.2');
+require_once __DIR__ . '/forumfortress/ClientIp.php';
+
+define('FORUMFORTRESS_MYBB_VERSION', '1.3.3');
 
 global $plugins;
 if(isset($plugins))
@@ -900,7 +902,11 @@ class ForumFortressMyBB
 		return array('ip' => self::ip(), 'username' => (string)$username, 'email' => (string)$email, 'email_domain' => self::email_domain($email), 'user_agent' => isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '', 'content' => $content, 'links' => self::links($content), 'forum_id' => isset($post['fid']) ? (int)$post['fid'] : 0, 'content_id' => isset($post['pid']) ? (string)$post['pid'] : '', 'thread_id' => isset($post['tid']) ? (string)$post['tid'] : '', 'subject' => isset($post['subject']) ? (string)$post['subject'] : '', 'account_age_seconds' => self::account_age($user), 'post_count' => isset($user['postnum']) ? (int)$user['postnum'] : 0);
 	}
 	public static function email_domain($email) { $at = strrpos((string)$email, '@'); return $at === false ? '' : strtolower(substr($email, $at + 1)); }
-	public static function ip() { if(function_exists('get_ip')) return (string)get_ip(); return isset($_SERVER['REMOTE_ADDR']) ? (string)$_SERVER['REMOTE_ADDR'] : ''; }
+	public static function ip()
+	{
+		$native = function_exists('get_ip') ? (string)get_ip() : '';
+		return \ForumFortress\Proxy\ClientIp::resolve($native, $_SERVER);
+	}
 	public static function links($content) { preg_match_all('~https?://[^\\s<>"\']+~i', (string)$content, $matches); return array_values(array_unique(isset($matches[0]) ? $matches[0] : array())); }
 	public static function event($endpoint, $decision, $payload, $response)
 	{

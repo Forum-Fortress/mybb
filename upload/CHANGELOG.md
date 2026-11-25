@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.3 - 2026-11-25
+
+- Report the visitor IP automatically behind reverse proxies that forward it.
+
 ## 1.3.2 - 2026-11-23
 
 - Check each registration once. Reuse the result during repeated validation and
